@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Supdev — Settings</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topnav">
+  <a class="logo" href="/"><span class="logomark">S</span>Supdev</a>
+  <a class="navlink" href="/">Board</a>
+  <a class="navlink" href="/">Chat</a>
+  <a class="navlink active" href="/settings">Settings</a>
+  <div class="spacer"></div>
+  <div class="popwrap">
+    <button id="avatar" class="avatar" aria-label="Account">?</button>
+    <div id="usermenu" class="popover" hidden>
+      <div class="who" id="whoami"></div><div class="sub" id="whosub"></div>
+      <div class="field tokenauth" hidden><label for="token">API token</label><input id="token" type="password" placeholder="paste your token"></div>
+      <div class="field devauth"><label for="tenant">Tenant</label><input id="tenant"></div>
+      <div class="field devauth"><label for="user">User</label><input id="user"></div>
+      <div class="field devauth"><label for="role">Role</label>
+        <select id="role"><option>viewer</option><option>developer</option><option>sre</option><option>lead</option><option selected>admin</option></select></div>
+      <div class="row" style="margin-top:8px"><button id="signout" class="subtle tokenauth" hidden>Sign out</button></div>
+    </div>
+  </div>
+</header>
+<div class="settings">
+  <nav class="snav" id="snav" aria-label="Settings sections"></nav>
+  <div class="spage"><div id="pagehead"></div><section id="panel"></section></div>
+</div>
+<div id="toasts" class="toasts"></div>
+<script src="/static/common.js"></script>
+<script src="/static/settings.js"></script>
+</body>
+</html>
