@@ -1,0 +1,22 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# runtime data — never commit (database holds encrypted tenant secrets; audit log; clones)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+audit.jsonl
+work/
+
+# secrets
+.supdev_master_key
+master.key
+.env
+.env.*
+!.env.example
