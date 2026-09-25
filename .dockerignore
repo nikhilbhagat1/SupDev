@@ -1,0 +1,17 @@
+.venv
+.git
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+examples
+docs
+*.db
+*.db-wal
+*.db-shm
+audit.jsonl
+.supdev_master_key
+work
+.env

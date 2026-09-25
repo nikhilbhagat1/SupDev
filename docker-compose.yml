@@ -1,0 +1,32 @@
+# docker compose up --build      (then open http://localhost:${SUPDEV_HOST_PORT:-8100})
+# First run: set SUPDEV_BOOTSTRAP_TOKEN (a long random string) — it becomes the first admin's API token.
+services:
+  supdev:
+    build: .
+    image: supdev:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SUPDEV_HOST_PORT:-8100}:8000"   # localhost only; put a TLS reverse proxy in front for remote access
+    environment:
+      SUPDEV_BOOTSTRAP_TENANT: ${SUPDEV_BOOTSTRAP_TENANT:-default}
+      SUPDEV_BOOTSTRAP_TOKEN: ${SUPDEV_BOOTSTRAP_TOKEN:?set SUPDEV_BOOTSTRAP_TOKEN to a long random string (e.g. openssl rand -hex 32)}
+      # Recommended in production: inject the encryption key from your secret manager instead of the key file in /data
+      SUPDEV_MASTER_KEY: ${SUPDEV_MASTER_KEY:-}
+      # Optional platform-default LLM (tenants can bring their own key in Settings → LLM)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Operator switches (all OFF by default; each widens what a tenant admin can make the platform do):
+      SUPDEV_ALLOW_PRIVATE_URLS: ${SUPDEV_ALLOW_PRIVATE_URLS:-}     # 1 = allow internal Grafana/Rancher/etc. URLs
+      SUPDEV_ALLOW_HTTP: ${SUPDEV_ALLOW_HTTP:-}
+      SUPDEV_ALLOW_STDIO_MCP: ${SUPDEV_ALLOW_STDIO_MCP:-}           # 1 = tenants may spawn local MCP processes
+      SUPDEV_MCP_ALLOWED_COMMANDS: ${SUPDEV_MCP_ALLOWED_COMMANDS:-}
+      SUPDEV_ALLOW_LOCAL_EXEC: ${SUPDEV_ALLOW_LOCAL_EXEC:-}         # 1 = run repo tests on this host
+    volumes:
+      - supdev-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  supdev-data:
