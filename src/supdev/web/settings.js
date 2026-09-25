@@ -23,7 +23,8 @@ const put = (path, body) => () => api(path, { method: "PUT", body: JSON.stringif
 // ------------------------------------------------------------------------------------------------ tabs
 const NAV = [
   ["AI", [["llm", "LLM provider", "Which model the agent uses and the API key it runs with."]]],
-  ["Connections", [["integrations", "Integrations", "Ticketing, source control, observability and design tools."], ["mcp", "MCP servers", "Connect MCP servers and choose exactly which tools the agent may use."]]],
+  ["Connections", [["integrations", "Integrations", "Ticketing, source control, observability and design tools."], ["mcp", "MCP servers", "Connect MCP servers and choose exactly which tools the agent may use."],
+    ["board", "Board", "Which Jira issue types each board shows."], ["sync", "Jira status sync", "Move the Jira ticket automatically when the agent changes phase."]]],
   ["Agent", [["policy", "Policy", "Limits and restrictions. A tenant policy can only tighten the platform baseline."]]],
   ["Workspace", [["general", "General", "Name, environments and context the agent should know."], ["tokens", "Users & tokens", "API tokens for your team."]]],
 ];
@@ -35,7 +36,7 @@ function render() {
   const meta = TABS.find((t) => t[0] === TAB);
   $("pagehead").replaceChildren(h("div", { class: "crumbs" }, "Settings / ", meta[1]), h("h1", {}, meta[1]), h("p", { class: "note" }, meta[2]));
   if (!CFG) return;
-  ({ llm: tabLLM, integrations: tabIntegrations, mcp: tabMCP, policy: tabPolicy, general: tabGeneral, tokens: tabTokens })[TAB](p);
+  ({ llm: tabLLM, integrations: tabIntegrations, mcp: tabMCP, board: tabBoard, sync: tabSync, policy: tabPolicy, general: tabGeneral, tokens: tabTokens })[TAB](p);
 }
 async function load() {
   try { CFG = await api("/config"); render(); }
@@ -63,8 +64,8 @@ function tabLLM(p) {
 
 // ------------------------------------------------------------------------------------------ integrations
 const FORMS = {
-  jira: { title: "Jira (ticketing)", fields: [["base_url", "Base URL", "https://acme.atlassian.net"], ["project", "Default project key (for follow-up tickets)", "OPS"]], secrets: [["token", "API token"], ["email", "Account email"]] },
-  github: { title: "GitHub (source control)", fields: [["repo", "Repository", "org/name"], ["default_branch", "Default branch", "main"], ["clone_url", "Clone URL (optional, https)", ""]], secrets: [["token", "Access token"]] },
+  jira: { title: "Jira (ticketing)", fields: [["base_url", "Base URL", "https://acme.atlassian.net"], ["project", "Default project key (releases + follow-up tickets)", "e.g. SCRUM — the KEY shown before ticket numbers"]], secrets: [["token", "API token"], ["email", "Account email"]] },
+  github: { title: "GitHub (source control)", fields: [["repo", "Repository", "org/name or https://github.com/org/name"], ["default_branch", "Default branch", "main"], ["clone_url", "Clone URL (optional, https)", ""]], secrets: [["token", "Access token"]] },
   figma: { title: "Figma (design)", fields: [], secrets: [["token", "Personal access token"]] },
   local_exec: { title: "Local test runner (execution)", fields: [["commands.tests", "Test command", "pytest -q"], ["commands.lint", "Lint command", "ruff check ."], ["commands.typecheck", "Type-check command", "mypy ."]], secrets: [], gate: "local_exec_allowed", gateNote: "Runs repository code on the platform host. The platform operator must enable it (SUPDEV_ALLOW_LOCAL_EXEC=1) and run the platform in a sandbox. It uses the clone made by the GitHub integration." },
   grafana: { title: "Grafana (metrics)", instances: [["url", "URL", "https://grafana.acme.io"], ["datasource_uid", "Prometheus datasource UID", "prom"]] },
@@ -104,9 +105,22 @@ function integrationCard(name, form) {
     if (form.instances) { config.instances = rows.map((r) => ({ env: r.env.value.trim(), ...Object.fromEntries(Object.entries(r.f).map(([k, i]) => [k, i.value.trim()])) })); rows.forEach((r) => { if (r.tok.value) secrets[r.env.value.trim()] = r.tok.value; }); }
     return { config, secrets };
   };
-  card.append(el("div", { class: "actions" },
-    el("button", { class: "primary", disabled: gated, onclick: () => save(put("/integrations/" + name, collect()), form.title + " saved") }, "Save"),
-    saved ? el("button", { onclick: async () => { res.textContent = "testing…"; res.className = "result"; try { const r = await api(`/integrations/${name}/test`, { method: "POST" }); res.textContent = r.results.map((x) => `${x.adapter ? x.adapter + ": " : ""}${x.ok ? "OK" : "FAILED"} — ${x.detail}`).join("\n"); res.style.whiteSpace = "pre-wrap"; res.className = "result " + (r.ok ? "ok" : "err"); } catch (e) { res.textContent = e.message; res.className = "result err"; } } }, "Test connection") : null,
+  const err = el("div", { class: "result err" });
+  const runTest = async () => {   // tests the form AS TYPED (nothing is saved); blank secret boxes fall back to the stored secret
+    res.textContent = "testing…"; res.className = "result"; res.style.whiteSpace = "pre-wrap";
+    try {
+      const r = await api(`/integrations/${name}/test`, { method: "POST", body: JSON.stringify(collect()) });
+      res.textContent = r.results.map((x) => `${x.adapter ? x.adapter + ": " : ""}${x.ok ? "✓ OK" : "✗ FAILED"} — ${x.detail}`).join("\n"); res.className = "result " + (r.ok ? "ok" : "err");
+    } catch (e) { res.textContent = "✗ " + e.message; res.className = "result err"; }
+  };
+  const doSave = async () => {
+    err.textContent = ""; saveBtn.disabled = true;
+    try { CFG = await api("/integrations/" + name, { method: "PUT", body: JSON.stringify(collect()) }); banner(form.title + " saved", true); render(); }
+    catch (e) { err.textContent = "Not saved: " + e.message; banner(e.message, false); saveBtn.disabled = false; }   // inline + toast: the reason stays visible
+  };
+  const saveBtn = el("button", { class: "primary", disabled: gated, onclick: doSave }, "Save");
+  card.append(err, el("div", { class: "actions" }, saveBtn,
+    el("button", { disabled: gated, title: "Check the credentials and settings shown above — without saving", onclick: runTest }, "Test connection"),
     saved ? el("button", { class: "danger", onclick: () => save(() => api("/integrations/" + name, { method: "DELETE" }), "Removed") }, "Remove") : null), res);
   return card;
 }
@@ -172,6 +186,80 @@ function mcpCard(srv, all) {
       !isNew ? el("button", { onclick: async () => { res.textContent = "testing…"; try { const r = await api("/integrations/mcp/test", { method: "POST" }); res.textContent = r.results.map((x) => `${x.adapter}: ${x.ok ? "OK" : "FAILED"} — ${x.detail}`).join("\n"); res.style.whiteSpace = "pre-wrap"; res.className = "result " + (r.ok ? "ok" : "err"); } catch (e) { res.textContent = e.message; res.className = "result err"; } } }, "Test connection") : null,
       !isNew ? el("button", { class: "danger", onclick: () => save(put("/integrations/mcp", { config: { servers: all.filter((x) => x.name !== srv.name) }, secrets: {} }), "Server removed") }, "Remove") : null), res);
   return card;
+}
+
+// ------------------------------------------------------------------------------------------ what your Jira really has
+let JIRA_META = null;   // {configured, types, statuses:[{name, category}]} — fetched from Jira; nothing is assumed about your project
+async function jiraMeta(force) {
+  if (JIRA_META && !force) return JIRA_META;
+  try { JIRA_META = await api("/jira/meta"); } catch (e) { JIRA_META = { configured: false, types: [], statuses: [], error: e.message }; }
+  return JIRA_META;
+}
+const notConnected = (m) => el("div", { class: "result err" }, m.error ? "Couldn't read your Jira project: " + m.error : "Connect the Jira integration (with a project key) first — Settings → Integrations.");
+
+// ------------------------------------------------------------------------------------------ Board (issue types per board)
+async function tabBoard(p) {
+  p.append(el("div", { class: "note" }, "Loading your Jira project…"));
+  const meta = await jiraMeta(true), labels = CFG.options.mode_labels, cfg = (CFG.tenant.board || {}).types || {};
+  p.replaceChildren();
+  if (!meta.configured || !meta.types.length) { p.append(el("div", { class: "panel-card" }, notConnected(meta))); return; }
+  const picks = {};
+  Object.keys(labels).forEach((mode) => {
+    const chosen = cfg[mode] == null ? null : cfg[mode].map((t) => t.toLowerCase());
+    const all = el("input", { type: "checkbox", checked: chosen === null });
+    const boxes = meta.types.map((t) => ({ t, c: el("input", { type: "checkbox", checked: chosen === null || chosen.includes(t.toLowerCase()) }) }));
+    const sync = () => boxes.forEach((b) => { b.c.disabled = all.checked; if (all.checked) b.c.checked = true; }); all.onchange = sync; sync();
+    picks[mode] = { all, boxes };
+    p.append(el("div", { class: "panel-card" }, el("h3", {}, labels[mode] + " board"),
+      el("div", { class: "note" }, `Issue types found in Jira project ${meta.project}. Epics and sub-tasks are never shown. People can still toggle types on the board itself; this sets what is on by default.`),
+      el("label", { class: "checks", style: "margin:8px 0" }, all, el("b", {}, " Every type (recommended — follows your Jira automatically)")),
+      el("div", { class: "checks" }, boxes.map((b) => el("label", {}, b.c, " ", b.t)))));
+  });
+  const err = el("div", { class: "result err" });
+  p.append(err, el("div", { class: "actions" }, el("button", { class: "primary", onclick: async () => {
+    const types = {}; Object.entries(picks).forEach(([mode, k]) => { types[mode] = k.all.checked ? null : k.boxes.filter((b) => b.c.checked).map((b) => b.t); });
+    err.textContent = "";
+    try { CFG = await api("/board", { method: "PUT", body: JSON.stringify({ types }) }); banner("Board settings saved", true); render(); }
+    catch (e) { err.textContent = "Not saved: " + e.message; banner(e.message, false); }
+  } }, "Save")));
+}
+
+// ------------------------------------------------------------------------------------------ Jira status sync
+async function tabSync(p) {
+  p.append(el("div", { class: "note" }, "Loading your Jira statuses…"));
+  const meta = await jiraMeta(true), cur = CFG.tenant.jira_sync || {}, phases = CFG.options.phases, labels = CFG.options.mode_labels;
+  const map = cur.map || {}, inputs = {};
+  p.replaceChildren();
+  const on = el("input", { type: "checkbox", checked: !!cur.enabled });
+  const list = el("datalist", { id: "jira-statuses" }, meta.statuses.map((s) => el("option", { value: s.name }, s.category)));
+  p.append(el("div", { class: "panel-card" }, el("h3", {}, "Automatic Jira status", cur.enabled ? status("on", "ok") : status("off", "warn")),
+    el("div", { class: "note" }, "When on, Supdev itself (not the model) moves the linked Jira ticket the moment the agent moves a work item FORWARD into a phase you map below. It uses your Jira integration's credentials, only performs transitions your Jira workflow allows, never moves a ticket backwards or reopens a Done ticket, only acts for users whose role may change ticket status, never blocks the phase change if Jira refuses, and every move is written to the audit log. Off by default, and nothing is assumed about your statuses — you choose them."),
+    meta.configured ? el("div", { class: "note" }, "Your Jira statuses: " + meta.statuses.map((s) => `${s.name} (${s.category})`).join(" · ")) : notConnected(meta),
+    el("label", { class: "checks", style: "margin:10px 0" }, el("span", { class: "checks" }, on, el("b", {}, " Move the Jira ticket automatically when the agent changes phase"))), list));
+  Object.entries(phases).forEach(([mode, rows]) => {
+    const trs = rows.map((ph, i) => {
+      const inp_ = el("input", { type: "text", list: "jira-statuses", value: ((map[mode] || {})[String(i + 1)] || []).join(", "), placeholder: "no change" }); inputs[`${mode}:${i + 1}`] = inp_;
+      return el("tr", {}, el("td", {}, `${i + 1}`), el("td", {}, ph.title, ph.hint ? el("span", { class: "note", style: "margin-left:6px" }, ph.hint === "work" ? "(work begins)" : "(out for review)") : null), el("td", {}, inp_));
+    });
+    p.append(el("div", { class: "panel-card" }, el("h3", {}, labels[mode] + " phases"),
+      el("div", { class: "note" }, "Type or pick real Jira status names; several can be listed, separated by commas — the first one your workflow allows wins. Blank = no change."),
+      el("table", { class: "tags" }, el("thead", {}, el("tr", {}, ["#", "Phase", "Move ticket to"].map((x) => el("th", {}, x)))), el("tbody", {}, trs))));
+  });
+  // Suggest by status CATEGORY (never by name): "work begins" -> first in-progress status; "out for review" -> the last one, if there are two or more.
+  const suggest = () => {
+    const prog = meta.statuses.filter((s) => s.category === "indeterminate");
+    Object.entries(phases).forEach(([mode, rows]) => rows.forEach((ph, i) => {
+      const inp_ = inputs[`${mode}:${i + 1}`]; if (!inp_ || !ph.hint) return;
+      inp_.value = ph.hint === "work" ? (prog[0] ? prog[0].name : "") : (prog.length > 1 ? prog[prog.length - 1].name : "");
+    }));
+  };
+  const err = el("div", { class: "result err" });
+  p.append(err, el("div", { class: "actions" }, el("button", { class: "primary", onclick: async () => {
+    const m = {}; Object.entries(inputs).forEach(([k, i]) => { const [mode, ph] = k.split(":"); const names = i.value.split(",").map((x) => x.trim()).filter(Boolean); (m[mode] = m[mode] || {})[ph] = names; });
+    err.textContent = "";
+    try { CFG = await api("/jira-sync", { method: "PUT", body: JSON.stringify({ enabled: on.checked, map: m }) }); banner(on.checked ? "Jira status sync is ON" : "Jira status sync is off", true); render(); }
+    catch (e) { err.textContent = "Not saved: " + e.message; banner(e.message, false); }
+  } }, "Save"), el("button", { class: "subtle", disabled: !meta.configured, title: "Fill the “work begins” / “out for review” phases from your Jira statuses, by category", onclick: suggest }, "Suggest from my Jira")));
 }
 
 // ----------------------------------------------------------------------------------------------- policy

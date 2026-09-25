@@ -1,13 +1,14 @@
 // Supdev chat + kanban UI. All dynamic text goes through the DOM builder `h` (textContent) — no innerHTML.
 const $ = _$;
 const st = {
-  view: localStorage.getItem("sd_view") || "board",
-  mode: localStorage.getItem("sd_mode") || "dev",
-  sid: localStorage.getItem("sd_sid") || null,
-  busy: false, sessions: [], feed: null, typing: null,
+  mode: localStorage.getItem("sd_mode") || "dev", sid: localStorage.getItem("sd_sid") || null,
+  busy: false, modes: [], feed: null, typing: null, ctx: null, starting: false, v: null,
 };
-const MODE_NAME = { dev: "Development", support: "Support" };
-const MODE_COLOR = { dev: "blue", support: "orange" };
+// Nothing about the workflow is hardcoded here: mode names come from /api/modes, issue types and statuses from Jira,
+// and colours are derived from the name so any type / mode (including plugins) gets a stable colour.
+const PALETTE = ["blue", "green", "orange", "purple", "red", "gray"];
+const colorFor = (name) => { let n = 0; for (const c of String(name || "").toLowerCase()) n = (n * 31 + c.charCodeAt(0)) >>> 0; return PALETTE[n % PALETTE.length]; };
+const modeLabel = (m) => (st.modes.find((x) => x.name === m) || {}).label || m;
 const shortId = (id) => (id || "").replace(/^(s_|wi_)/, "").slice(0, 6).toUpperCase();
 
 async function api(path, opts = {}) {
@@ -21,92 +22,177 @@ const loz = (text, color) => h("span", { class: "lozenge " + (color || "") }, te
 // ------------------------------------------------------------------------------------------ shell
 function setState(k, v) { st[k] = v; localStorage.setItem("sd_" + k, v ?? ""); }
 function renderNav() {
-  $("nav-board").classList.toggle("active", st.view === "board");
-  $("nav-chat").classList.toggle("active", st.view === "chat");
+  $("nav-board").classList.add("active");
+  const seg = $("modeseg");
+  if (seg.children.length !== st.modes.length) seg.replaceChildren(...st.modes.map((m) => h("button", { "data-mode": m.name, role: "tab", onclick: () => { setState("mode", m.name); closePanel(); show(); } }, m.label)));
   document.querySelectorAll("#modeseg button").forEach((b) => { const on = b.dataset.mode === st.mode; b.classList.toggle("on", on); b.setAttribute("aria-selected", on); });
 }
-async function show(view) {
-  setState("view", view); renderNav(); renderSidebar();
-  document.querySelector(".app").classList.toggle("nosidebar", view === "board"); // work-item list belongs to Chat only
-  return view === "board" ? showBoard() : showChat();
-}
+async function show() { renderNav(); return showBoard(); }
+async function refreshBoard() { try { boardData = await api("/board?mode=" + st.mode); drawColumns(); } catch (e) { /* keep what we have */ } }
 
-async function loadSessions() {
-  try { st.sessions = await api("/sessions"); } catch (e) { st.sessions = []; toast(e.message, true); }
-  renderSidebar();
-}
-function renderSidebar() {
-  const q = ($("search").value || "").toLowerCase();
-  $("listtitle").textContent = MODE_NAME[st.mode] + " work items";
-  const items = st.sessions.filter((s) => (s.mode === st.mode || s.mode === null) && (!q || s.title.toLowerCase().includes(q) || (s.ref || "").toLowerCase().includes(q)));
-  const box = $("wilist"); box.replaceChildren();
-  if (!items.length) box.append(h("div", { class: "note", style: "padding:8px;color:var(--sub)" }, "Nothing here yet. Use Create to start."));
-  items.forEach((s) => {
-    box.append(h("button", { class: "wi" + (s.id === st.sid ? " on" : ""), onclick: () => openSession(s.id) },
-      h("span", { class: "t" }, s.title),
-      h("span", { class: "m" }, s.mode ? loz(MODE_NAME[s.mode], MODE_COLOR[s.mode]) : loz("not started"),
-        s.phase ? loz(`${s.phase}/${s.phase_total} ${s.phase_title}`, "gray") : null, s.pending ? loz("needs approval", "yellow") : null,
-        h("span", { class: "k" }, s.ref || shortId(s.id)))));
-  });
-}
-
-async function openSession(sid, resumeWi) {
-  try {
-    if (resumeWi) await api(`/sessions/${sid}/resume/${resumeWi}`, { method: "POST" });
-    setState("sid", sid); await show("chat"); loadSessions();
-  } catch (e) { toast(e.message, true); }
-}
-
-// ------------------------------------------------------------------------------------------ board
-const rel = { list: [], project: null, configured: null, selected: localStorage.getItem("sd_release") || "", keys: null, loading: false };
+const CAT_COLOR = { new: "gray", indeterminate: "blue", done: "green" };
+const rel = { list: [], project: null, configured: null, selected: "", keys: null, truncated: false,
+  types: null, group: localStorage.getItem("sd_group") || "jira" };
 let boardData = null;
+let jira = { configured: null, project: null, columns: [], issues: [], epics: [], can_move: false, error: null, syncedAt: 0 };
+let syncTimer = null, syncTick = 0;
+const useJira = () => rel.group === "jira" && jira.configured && jira.columns.length > 0;
 
-function tile(card) {
-  const meta = h("div", { class: "l" }, h("span", { class: "key" }, card.ref || shortId(card.work_item_id || card.session_id)),
-    card.pending ? loz("approval", "yellow") : null, card.status === "parked" ? loz("parked", "gray") : null, card.status === "handed_off" ? loz("handed off", "purple") : null);
-  return h("div", { class: "tile", role: "button", tabindex: "0", title: "Open chat", onclick: () => openSession(card.session_id, card.status === "parked" ? card.work_item_id : null),
-    onkeydown: (e) => { if (e.key === "Enter") e.currentTarget.click(); } },
-    h("span", { class: "t" }, card.title), h("div", { class: "f" }, meta, avatar($("user")?.value || "me")));
+// ---- items: Jira tickets (tasks/stories/bugs) merged with Supdev work items and chats
+function buildItems() {
+  const epicKeys = new Set((jira.epics || []).map((k) => k.toUpperCase()));           // epics are never shown — nor work items opened on them
+  const cards = (boardData ? boardData.cards : []).filter((c) => !(c.ref && epicKeys.has(c.ref.toUpperCase()))), chats = boardData ? boardData.backlog : [];
+  const byKey = new Map(); cards.forEach((c) => c.ref && byKey.set(c.ref.toUpperCase(), c));
+  const active = activeTypes(), tickets = jira.issues.filter((i) => active.has(i.type.toLowerCase()));
+  const linked = new Set(), out = [];
+  tickets.forEach((i) => {
+    const wi = byKey.get(i.key.toUpperCase()) || null; if (wi) linked.add(wi.work_item_id);
+    out.push({ key: i.key, title: i.summary, type: i.type, status: i.status, status_id: i.status_id, cat: i.status_category, assignee: i.assignee, url: i.url, issue: i, wi });
+  });
+  cards.filter((c) => !linked.has(c.work_item_id)).forEach((c) => out.push({ key: c.ref, title: c.title, type: "", wi: c, issue: null }));
+  chats.forEach((c) => out.push({ key: null, title: c.title, type: "", chat: c, issue: null }));
+  return out;
 }
-const col = (title, cards, cls, emptyText) => h("div", { class: "col " + (cls || "") }, h("h4", {}, title, h("span", { class: "count" }, cards.length)),
-  cards.length ? cards.map(tile) : h("div", { class: "empty-col" }, emptyText || "—"));
+const keepItem = (x) => {
+  if (rel.keys && !(x.key && rel.keys.has(x.key.toUpperCase()))) return false;            // release filter (by ticket key)
+  return true;
+};
+function jiraColumns(items) {
+  const cols = jira.columns.map((c, i) => ({ id: "j" + i, title: c.name, status_ids: c.status_ids, items: [], droppable: jira.can_move }));
+  const other = { id: "jo", title: "Other statuses", items: [] }, local = { id: "jl", title: "Supdev only", cls: "backlog", items: [], hint: "Chats and work items without a Jira ticket" };
+  items.forEach((x) => { if (!x.issue) { local.items.push(x); return; } (cols.find((c) => c.status_ids.includes(x.status_id)) || other).items.push(x); });
+  return [...cols, ...(other.items.length ? [other] : []), ...(local.items.length ? [local] : [])];   // Jira columns lead, To Do first
+}
+function phaseColumns(items) {
+  const backlog = { id: "pb", title: "Backlog", cls: "backlog", items: [] }, cols = boardData.phases.map((t, i) => ({ id: "p" + i, title: `${i + 1}. ${t}`, items: [] }));
+  items.forEach((x) => { if (x.wi && x.wi.phase) cols[x.wi.phase - 1].items.push(x); else backlog.items.push(x); });
+  return [backlog, ...cols];
+}
 
-// Cards are kept when no release is selected, or when their Jira ticket key is in the selected release.
-const keepCard = (c) => !rel.keys || (c.ref && rel.keys.has(c.ref.toUpperCase()));
+function tile(x, col, cols) {
+  const wi = x.wi, canDrag = !!(x.issue && col.droppable);
+  const keyEl = x.url ? h("a", { class: "key", href: x.url, target: "_blank", rel: "noopener noreferrer", title: "Open in Jira" }, x.key)
+    : h("span", { class: "key" }, x.key || shortId(x.chat ? x.chat.session_id : wi && wi.session_id));
+  const meta = [];
+  if (!useJira() && x.issue) meta.push(loz(x.status, CAT_COLOR[x.cat] || "gray"));       // in the phase view show the Jira status
+  if (useJira() && wi) meta.push(loz(`Phase ${wi.phase}/${boardData.phases.length}`, "purple"));
+  if (wi && wi.pending) meta.push(loz("approval", "yellow"));
+  if (wi && wi.status === "parked") meta.push(loz("parked", "gray"));
+  if (wi && wi.status === "handed_off") meta.push(loz("handed off", "purple"));
+  const extra = [];
+  if (x.issue && !wi) extra.push(h("button", { class: "primary small", title: "Start working on this ticket with Supdev", onclick: (e) => { e.stopPropagation(); startTicket(x); } }, "Start"));
+  else if (wi) extra.push(h("button", { class: "subtle small", title: "Open this ticket's chat", onclick: (e) => { e.stopPropagation(); openCard(x); } }, "Continue"));
+  if (x.issue && jira.can_move && useJira()) extra.push(h("button", { class: "subtle small movebtn", title: "Move to another column", "aria-label": `Move ${x.key}`, onclick: (e) => { e.stopPropagation(); openMoveMenu(x, cols, e.currentTarget); } }, "⋯"));
+  const who = x.assignee ? avatar(x.assignee) : x.issue ? h("span", { class: "avatar sm unassigned", title: "Unassigned" }, "?") : avatar($("user")?.value || "me");
+  const isSel = st.ctx && ((x.key && x.key === st.ctx.key) || (wi && wi.session_id === st.ctx.sid) || (x.chat && x.chat.session_id === st.ctx.sid));
+  const el = h("div", { class: "tile" + (canDrag ? " draggable" : "") + (isSel ? " sel" : ""), role: "button", tabindex: "0", "data-key": x.key || "", title: "Open chat and details" },
+    h("div", { class: "row" }, x.type ? loz(x.type, colorFor(x.type)) : null, keyEl),
+    h("span", { class: "t" }, x.title),
+    h("div", { class: "f" }, h("div", { class: "l" }, ...meta, ...extra), who));
+  el.addEventListener("click", (e) => { if (e.target.closest("a,button")) return; openCard(x); });
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target === el) el.click(); });
+  if (canDrag) {
+    el.draggable = true;
+    el.addEventListener("dragstart", (e) => { st.drag = x; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", x.key); el.classList.add("dragging"); });
+    el.addEventListener("dragend", () => { st.drag = null; el.classList.remove("dragging"); document.querySelectorAll(".col.over").forEach((c) => c.classList.remove("over")); });
+  }
+  return el;
+}
+function renderCol(col, cols) {
+  const el = h("div", { class: "col " + (col.cls || ""), "data-col": col.id }, h("h4", {}, col.title, h("span", { class: "count" }, col.items.length)),
+    col.hint ? h("div", { class: "note colhint" }, col.hint) : null,
+    h("div", { class: "colbody" }, col.items.length ? col.items.map((x) => tile(x, col, cols)) : h("div", { class: "empty-col" }, col.droppable ? "Drop here" : "—")));
+  if (col.droppable) {
+    el.addEventListener("dragover", (e) => { if (!st.drag) return; e.preventDefault(); e.dataTransfer.dropEffect = "move"; el.classList.add("over"); });
+    el.addEventListener("dragleave", (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove("over"); });
+    el.addEventListener("drop", (e) => { e.preventDefault(); el.classList.remove("over"); if (st.drag) moveIssue(st.drag, col); });
+  }
+  return el;
+}
 function drawColumns() {
-  const b = boardData, el = $("boardcols"); if (!b || !el) return;
-  const filtering = !!rel.keys;
-  const cards = b.cards.filter(keepCard), backlog = filtering ? [] : b.backlog.map((x) => ({ ...x, work_item_id: null, ref: null, status: "new", pending: 0 }));
-  el.replaceChildren(col("Backlog", backlog, "backlog", filtering ? "Hidden while filtering" : "No unrouted chats"),
-    ...b.phases.map((t, i) => col(`${i + 1}. ${t}`, cards.filter((x) => x.phase === i + 1), "")));
-  const sel = rel.list.find((r) => r.id === rel.selected), total = b.cards.length;
-  const st_ = $("boardstatus"); if (!st_) return;
-  st_.replaceChildren(filtering && sel
-    ? h("span", {}, `Showing ${cards.length} of ${total} work item${total === 1 ? "" : "s"} in release `, h("b", {}, sel.name), rel.truncated ? " (first 100 tickets)" : "", " · ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); selectRelease(""); } }, "Clear filter"))
-    : `${total} work item${total === 1 ? "" : "s"} · a card moves to the next column when the agent completes that phase — approvals happen in the card's chat.`);
+  const box = $("boardcols"); if (!box || !boardData) return;
+  const items = buildItems().filter(keepItem), cols = useJira() ? jiraColumns(items) : phaseColumns(items);
+  box.replaceChildren(...cols.map((c) => renderCol(c, cols)));
+  const sel = rel.list.find((r) => r.id === rel.selected), s = $("boardstatus"); if (!s) return;
+  const shown = items.length;
+  const parts = [];
+  if (rel.keys && sel) parts.push(h("span", {}, `Release `, h("b", {}, sel.name), ` · ${shown} item${shown === 1 ? "" : "s"}`,
+    rel.viaEpics && rel.viaEpics.length ? ` (includes work under epic ${rel.viaEpics.join(", ")})` : "",
+    shown ? "" : " — no matching tickets. Set “Fix versions” on tickets (or on their epic) to this release in Jira.", " · ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); selectRelease(""); } }, "Clear filter")));
+  else if (jira.configured === false) parts.push("Connect Jira in Settings to see your tasks, stories and bugs. Showing Supdev work items by phase.");
+  else if (useJira()) parts.push(`${shown} item${shown === 1 ? "" : "s"} from Jira project ${jira.project} · drag a card to change its Jira status${jira.can_move ? "" : " (your role can't move cards)"}`);
+  else parts.push("Columns are Supdev phases — a card moves when the agent completes a phase; approvals happen in the card's chat.");
+  s.replaceChildren(...parts);
   document.querySelectorAll(".rel").forEach((n) => n.classList.toggle("sel", n.dataset.id === rel.selected));
+  const g = $("groupseg"); if (g) { g.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.group === (useJira() ? "jira" : "phase"))); g.querySelector('[data-group="jira"]').disabled = !(jira.configured && jira.columns.length); }
+}
+
+// ---- move a ticket (Jira workflow transition)
+async function moveIssue(x, col) {
+  const iss = x.issue; if (!iss || !col.status_ids || col.status_ids.includes(iss.status_id)) return;
+  const prev = { status: iss.status, status_id: iss.status_id };
+  iss.status_id = col.status_ids[0]; iss.status = col.title; drawColumns();              // optimistic
+  try {
+    const r = await api(`/issues/${encodeURIComponent(iss.key)}/move`, { method: "POST", body: JSON.stringify({ status_ids: col.status_ids }) });
+    toast(`${iss.key} moved to ${r.status} in Jira`); await refreshJira(true);
+  } catch (e) { Object.assign(iss, prev); drawColumns(); toast(e.message, true); }      // Jira said no: put the card back
+}
+function openMoveMenu(x, cols, btn) {
+  document.querySelectorAll(".menu").forEach((m) => m.remove());
+  const targets = cols.filter((c) => c.droppable && !c.status_ids.includes(x.issue.status_id));
+  const menu = h("div", { class: "menu", role: "menu" }, h("div", { class: "menuh" }, `Move ${x.key} to`), ...targets.map((c) => h("button", { class: "subtle", role: "menuitem", onclick: () => { menu.remove(); moveIssue(x, c); } }, c.title)));
+  const r = btn.getBoundingClientRect(); menu.style.top = r.bottom + window.scrollY + 4 + "px"; menu.style.left = Math.max(8, r.left + window.scrollX - 120) + "px";
+  document.body.append(menu);
+  setTimeout(() => document.addEventListener("click", function close(e) { if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener("click", close); } }), 0);
+  menu.querySelector("button")?.focus();
+}
+
+// ---- sync with Jira (poll while the board is open; also on demand)
+async function refreshJira(force) {
+  try { const r = await api("/issues" + (force ? "?refresh=true" : "")); jira = { ...jira, ...r, error: null, syncedAt: Date.now() }; }
+  catch (e) { jira.error = e.message; if (jira.configured === null) jira.configured = false; }
+  if (st.ctx && st.ctx.key && (jira.epics || []).some((k) => k.toUpperCase() === st.ctx.key.toUpperCase())) closePanel();
+  fillTypeChips(); drawColumns(); updateSync();
+  if (st.ctx) { drawPanelHeader(st.v); drawPanelDetails(st.v); }   // keep the open ticket's Jira status fresh
+}
+function updateSync() { const el = $("syncinfo"); if (!el) return; el.textContent = jira.error ? "Sync failed: " + jira.error : jira.syncedAt ? "Synced " + ago(jira.syncedAt / 1000) : ""; el.className = jira.error ? "syncinfo bad" : "syncinfo"; }
+function startSync() { stopSync(); syncTick = 0; syncTimer = setInterval(() => { syncTick++; updateSync(); if (syncTick % 3 === 0 && !document.hidden) refreshJira(false); }, 15000); }
+function stopSync() { if (syncTimer) clearInterval(syncTimer); syncTimer = null; }
+const presentTypes = () => [...new Set(jira.issues.map((i) => i.type.toLowerCase()))];
+const activeTypes = () => rel.types || new Set((boardData && boardData.types ? boardData.types.map((t) => t.toLowerCase()) : presentTypes()));
+function fillTypeChips() {
+  const box = $("typechips"); if (!box) return;
+  const counts = new Map(); jira.issues.forEach((i) => counts.set(i.type.toLowerCase(), (counts.get(i.type.toLowerCase()) || 0) + 1));
+  const names = new Map(); jira.issues.forEach((i) => names.set(i.type.toLowerCase(), i.type));
+  (boardData && boardData.types ? boardData.types : []).forEach((t) => { if (!names.has(t.toLowerCase())) names.set(t.toLowerCase(), t); });   // configured but no tickets yet
+  const on = activeTypes();
+  box.replaceChildren(...[...names.keys()].sort().map((t) => {
+    const n = counts.get(t) || 0;
+    return h("button", { class: "tchip" + (on.has(t) ? " on" : "") + (n ? "" : " none"), "aria-pressed": on.has(t), disabled: !jira.configured,
+      title: n ? `${n} ${names.get(t)} ticket${n === 1 ? "" : "s"} in Jira` : `No ${names.get(t)} tickets in this Jira project`,
+      onclick: () => { const next = new Set(activeTypes()); if (next.has(t)) next.delete(t); else next.add(t); rel.types = next; fillTypeChips(); drawColumns(); } },
+      names.get(t), h("span", { class: "n" }, n));
+  }));
 }
 
 async function selectRelease(id) {
-  rel.selected = id; localStorage.setItem("sd_release", id); rel.keys = null; rel.truncated = false;
+  rel.selected = id; rel.keys = null; rel.truncated = false; rel.viaEpics = [];
   if ($("relsel")) $("relsel").value = id;
   if (!id) { drawColumns(); return; }
   try {
     const r = await api(`/releases/${encodeURIComponent(id)}/issues`);
     if (rel.selected !== id) return; // user changed their mind while loading
-    rel.keys = new Set(r.keys.map((k) => k.toUpperCase())); rel.truncated = r.truncated;
-  } catch (e) { toast("Couldn't load that release's tickets: " + e.message, true); rel.selected = ""; localStorage.setItem("sd_release", ""); if ($("relsel")) $("relsel").value = ""; }
+    rel.keys = new Set(r.keys.map((k) => k.toUpperCase())); rel.truncated = r.truncated; rel.viaEpics = r.via_epics || [];
+  } catch (e) { toast("Couldn't load that release's tickets: " + e.message, true); rel.selected = ""; if ($("relsel")) $("relsel").value = ""; }
   drawColumns();
 }
 function fillReleaseSelect() {
   const sel = $("relsel"); if (!sel) return;
   const opt = (r) => h("option", { value: r.id }, r.name + (r.overdue ? " (overdue)" : ""));
-  const up = rel.list.filter((r) => !r.released), done = rel.list.filter((r) => r.released);
-  sel.replaceChildren(h("option", { value: "" }, "All releases"),
-    ...(up.length ? [h("optgroup", { label: "Unreleased" }, up.map(opt))] : []), ...(done.length ? [h("optgroup", { label: "Released" }, done.map(opt))] : []));
+  sel.replaceChildren(h("option", { value: "" }, "All releases"), ...rel.list.map(opt));   // plain list, no group headings (status lives in the side panel)
   sel.disabled = !rel.configured || !rel.list.length;
   sel.title = rel.configured ? (rel.list.length ? "Show only work items whose Jira ticket is in this release" : "No releases found") : "Connect Jira in Settings to filter by release";
-  if (rel.selected && !rel.list.some((r) => r.id === rel.selected)) { rel.selected = ""; localStorage.setItem("sd_release", ""); }
+  if (rel.selected && !rel.list.some((r) => r.id === rel.selected)) { rel.selected = ""; }
   sel.value = rel.selected;
 }
 
@@ -114,17 +200,22 @@ async function showBoard() {
   const c = $("content"); c.replaceChildren(h("div", { class: "page" }, h("div", { class: "note" }, "Loading board…")));
   try { boardData = await api("/board?mode=" + st.mode); } catch (e) { c.replaceChildren(h("div", { class: "page" }, h("div", { class: "toast err" }, e.message))); return; }
   const relsel = h("select", { id: "relsel", "aria-label": "Release filter", disabled: true, onchange: (e) => selectRelease(e.target.value) }, h("option", { value: "" }, "All releases"));
+  const seg = h("div", { class: "seg", id: "groupseg", role: "group", "aria-label": "Group columns by" },
+    h("button", { "data-group": "jira", onclick: () => { rel.group = "jira"; localStorage.setItem("sd_group", "jira"); drawColumns(); } }, "Jira status"),
+    h("button", { "data-group": "phase", onclick: () => { rel.group = "phase"; localStorage.setItem("sd_group", "phase"); drawColumns(); } }, "Supdev phase"));
   const rail = h("aside", { class: "rail", "aria-label": "Jira releases" });
   c.replaceChildren(h("div", { class: "page wide" },
-    h("div", { class: "crumbs" }, h("a", { href: "#", onclick: (e) => { e.preventDefault(); show("board"); } }, "Boards"), " / ", MODE_NAME[st.mode]),
-    h("h1", {}, MODE_NAME[st.mode] + " board"),
-    h("div", { class: "toolbar" }, h("label", { class: "filter", for: "relsel" }, h("span", {}, "Release"), relsel), h("span", { id: "boardstatus", class: "note" })),
+    h("div", { class: "crumbs" }, h("a", { href: "#", onclick: (e) => { e.preventDefault(); show("board"); } }, "Boards"), " / ", modeLabel(st.mode)),
+    h("h1", {}, modeLabel(st.mode) + " board"),
+    h("div", { class: "toolbar" }, h("label", { class: "filter", for: "relsel" }, h("span", {}, "Release"), relsel), h("div", { class: "filter" }, h("span", {}, "Types"), h("div", { class: "tchips", id: "typechips", role: "group", "aria-label": "Issue types to show" })),
+      h("label", { class: "filter" }, h("span", {}, "Group by"), seg),
+      h("button", { class: "subtle", title: "Sync with Jira now", onclick: () => refreshJira(true) }, "↻ Sync"), h("span", { id: "syncinfo", class: "syncinfo" })),
+    h("div", { id: "boardstatus", class: "note", style: "margin:2px 0 0" }),
     h("div", { class: "boardlayout" }, h("div", { class: "board", id: "boardcols" }), rail)));
-  rel.keys = null; drawColumns();
-  loadReleases(rail, false);
+  rel.keys = null; rel.types = null; fillTypeChips(); drawColumns();
+  loadReleases(rail, false); refreshJira(false); startSync();
 }
 
-// ---- Jira releases (project versions), shown at the right of the board
 const fmtDate = (d) => (d ? new Date(d + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "");
 async function loadReleases(rail, refresh) {
   const head = (project) => h("div", { class: "rh" }, h("h3", {}, "Releases"), project ? loz(project, "blue") : null,
@@ -152,87 +243,104 @@ async function loadReleases(rail, refresh) {
   rail.replaceChildren(...[head(r.project),
     up.length ? h("h4", {}, "Unreleased") : null, ...up.map(item),
     done.length ? h("h4", {}, "Recently released") : null, ...done.map(item),
-    !r.releases.length ? h("div", { class: "msg" }, "No releases in this project yet.") : null].filter(Boolean));
+    !r.releases.length ? h("div", { class: "msg" }, `No releases in ${r.project} yet. Create one in Jira (Project → Releases), then press ↻. `, h("a", { href: r.manage_url, target: "_blank", rel: "noopener noreferrer" }, "Open Jira releases")) : null].filter(Boolean));
   if (rel.selected) await selectRelease(rel.selected); else drawColumns();
 }
 
-// ------------------------------------------------------------------------------------------ chat
-function showChat() {
-  if (!st.sid) {
-    $("content").replaceChildren(h("div", { class: "empty" }, h("h1", {}, "Start a chat"),
-      h("p", {}, "Describe the work or the incident. Supdev clarifies, plans and investigates — and stops at every gate for your approval."),
-      h("div", { class: "picks" },
-        h("button", { class: "pick", onclick: () => openCreate("dev") }, h("b", {}, "Development"), h("span", {}, "Ticket, story or design → clarify → plan → approved code → tests → PR.")),
-        h("button", { class: "pick", onclick: () => openCreate("support") }, h("b", {}, "Support"), h("span", {}, "Production issue → triage → evidence → RCA → approved outputs. Production stays read-only.")))));
-    return;
-  }
-  return loadItem(true);
+// ------------------------------------------------------------------------------------------ ticket chat (left panel)
+// Each ticket / work item has its OWN chat session and its own details; the panel shows one at a time next to the board.
+const panelEl = () => $("chatpanel");
+const issueOf = (key) => (key ? jira.issues.find((i) => i.key === key) || null : null);
+
+function closePanel() {
+  st.ctx = null; st.v = null; st.feed = null; st.typing = null; setState("sid", null);
+  panelEl().hidden = true; panelEl().replaceChildren();
+  document.querySelectorAll(".tile.sel").forEach((t) => t.classList.remove("sel"));
+}
+// Open a card in the panel. Started tickets open their chat; not-started ones open details with a Start button.
+async function openCard(x, sidOverride) {
+  const wi = x.wi, sid = sidOverride || (wi ? wi.session_id : x.chat ? x.chat.session_id : null);
+  try { if (wi && wi.status === "parked") await api(`/sessions/${sid}/resume/${wi.work_item_id}`, { method: "POST" }); } catch (e) { toast(e.message, true); return; }
+  await openPanel({ key: x.key || null, title: x.title, type: x.type }, sid);
+}
+async function openPanel(ctx, sid) {
+  st.ctx = { ...ctx, sid: sid || null }; setState("sid", sid || null);
+  panelEl().hidden = false; buildPanel();
+  document.querySelectorAll(".tile.sel").forEach((t) => t.classList.remove("sel"));
+  document.querySelectorAll(".tile").forEach((t) => { if (ctx.key && t.dataset.key === ctx.key) t.classList.add("sel"); });
+  if (sid) await loadPanel(true); else drawPanelHeader(null), drawPanelDetails(null), drawApprovals(null);
 }
 
-async function loadItem(full) {
-  let v;
-  try { v = await api("/sessions/" + st.sid); } catch (e) { setState("sid", null); toast(e.message, true); return showChat(); }
-  if (v.active && v.active.mode !== st.mode) { setState("mode", v.active.mode); renderNav(); renderSidebar(); }
-  if (full) buildItem(v);
-  drawHeader(v); drawApprovals(v); drawDetails(v);
+function buildPanel() {
+  const sid = st.ctx.sid;
+  st.feed = h("div", { class: "feed", "aria-live": "polite" });
+  const input = h("textarea", { id: "input", rows: "2", placeholder: "Message about this ticket… (Enter to send, Shift+Enter for a new line; type “approved” at a gate)" });
+  input.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } };
+  panelEl().replaceChildren(
+    h("div", { class: "phead" }, h("div", { id: "phdr" })),
+    h("div", { class: "pbody", id: "pbody" },
+      // ticket details sit above the conversation: open until work starts, then out of the way
+      h("details", { class: "pdetails", id: "pdet", open: !sid }, h("summary", {}, "Ticket details"), h("div", { id: "pdetails", class: "details" })),
+      st.feed, h("div", { id: "approvals", class: "actionpanel" })),
+    h("form", { class: "composer", id: "pcomposer", hidden: !sid, onsubmit: (e) => { e.preventDefault(); send(input); } }, avatar($("user")?.value || "me", "sm"),
+      h("div", { class: "box" }, input, h("div", { class: "actions" }, h("button", { class: "primary", id: "send", type: "submit" }, "Send"), h("span", { class: "hint" }, "Only a human can approve gates.")))));
+  if (!sid) st.feed.append(h("div", { class: "pempty" }, h("b", {}, "Not started yet"), h("div", {}, "Press Start and Supdev will read the ticket, ask what it needs to know, and plan before any code is written."), startBtn()));
+}
+function startBtn() { return h("button", { class: "primary", onclick: () => startTicket(st.ctx) }, "Start"); }
+
+async function loadPanel(full) {
+  if (!st.ctx || !st.ctx.sid) return null;
+  let v; try { v = await api("/sessions/" + st.ctx.sid); } catch (e) { toast(e.message, true); closePanel(); return null; }
+  st.v = v;
+  if (full) {
+    st.feed.replaceChildren(); v.messages.forEach((m) => addPost(m.role, m.text, m.ts));
+    if (!v.messages.length) st.feed.append(h("div", { class: "event ph" }, h("span", { class: "dot" }), "No messages yet — say what you need below."));
+    $("pbody").scrollTop = 1e9;
+  }
+  drawPanelHeader(v); drawApprovals(v); drawPanelDetails(v);
   return v;
 }
 
-function buildItem(v) {
-  st.feed = h("div", { class: "feed", "aria-live": "polite" });
-  v.messages.forEach((m) => addPost(m.role, m.text, m.ts));
-  if (!v.messages.length) st.feed.append(h("div", { class: "event" }, h("span", { class: "dot" }), "No messages yet — describe the work below."));
-  const input = h("textarea", { id: "input", rows: "2", placeholder: "Add a comment or answer… (Enter to send, Shift+Enter for a new line; type “approved” at a gate or use the button)" });
-  const form = h("form", { class: "composer", onsubmit: (e) => { e.preventDefault(); send(input); } }, avatar($("user")?.value || "me", "sm"),
-    h("div", { class: "box" }, input, h("div", { class: "actions" }, h("button", { class: "primary", id: "send", type: "submit" }, "Send"), h("span", { class: "hint" }, "Only a human can approve gates."))));
-  input.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } };
-  $("content").replaceChildren(h("div", { class: "page" },
-    h("div", { id: "hdr" }),
-    h("div", { class: "itemcols" },
-      h("section", { class: "activity" }, h("h2", {}, "Activity"), st.feed, h("div", { id: "approvals", class: "actionpanel" }), form),
-      h("aside", { class: "details", id: "details" }))));
-  st.feed.scrollTop = 1e9; window.scrollTo(0, 0);
-}
-
-const TAG = /^\s*\[(DEV|SUPPORT|ROUTER)([^\]]*)\]\s*/;
+const TAG = /^\s*\[([A-Z][A-Z0-9_]*)([^\]]*)\]\s*/;   // any mode tag, incl. plugin modes
 function addPost(role, text, ts) {
   if (role !== "user" && role !== "assistant") return;
   let tag = null, body = text; const m = TAG.exec(text);
   if (m && role === "assistant") { tag = (m[1] + m[2]).replace(/\s*·\s*/g, " · ").trim(); body = text.slice(m[0].length); }
   const me = $("user")?.value || "me";
+  st.feed.querySelectorAll(".event.ph").forEach((e) => e.remove());   // drop the "no messages yet" hint
   st.feed.append(h("div", { class: "post " + role }, role === "user" ? avatar(me) : botAvatar(),
     h("div", { class: "body" }, h("div", { class: "hd" }, h("span", { class: "name" }, role === "user" ? "You" : "Supdev"), ts ? h("span", { class: "ts" }, ago(ts)) : null, tag ? loz(tag, "blue") : null),
       h("div", { class: "txt" }, body))));
-  st.feed.parentElement && (document.scrollingElement.scrollTop = document.scrollingElement.scrollHeight);
+  const pb = $("pbody"); if (pb) pb.scrollTop = pb.scrollHeight;
 }
-function addEvent(text, cls) { if (!st.feed) return; st.feed.append(h("div", { class: "event " + (cls || "") }, h("span", { class: "dot" }), text)); }
+function addEvent(text, cls) { if (!st.feed) return; st.feed.append(h("div", { class: "event " + (cls || "") }, h("span", { class: "dot" }), text)); const pb = $("pbody"); if (pb) pb.scrollTop = pb.scrollHeight; }
 function setTyping(on) {
   if (st.typing) { st.typing.remove(); st.typing = null; }
   if (on && st.feed) { st.typing = h("div", { class: "typing" }, h("i"), h("i"), h("i"), h("span", {}, "Supdev is working…")); st.feed.append(st.typing); }
 }
 
-function drawHeader(v) {
-  const a = v.active, box = $("hdr"); if (!box) return;
-  if (!a) {
-    box.replaceChildren(h("div", { class: "crumbs" }, "Chat / ", shortId(v.id)), h("h1", {}, v.awaiting_router ? "Which mode?" : "New chat"),
-      h("div", { class: "row" }, v.awaiting_router ? loz("waiting for your choice", "yellow") : loz("not started")),
-      h("p", { class: "note" }, v.awaiting_router ? "Reply “dev” or “support” below." : "Describe the work or the incident to begin."));
-    return;
-  }
-  const pend = a.pending_approvals.length;
-  box.replaceChildren(
-    h("div", { class: "crumbs" }, h("a", { href: "#", onclick: (e) => { e.preventDefault(); show("board"); } }, MODE_NAME[a.mode] + " board"), " / ", a.ref || shortId(a.id)),
-    h("h1", {}, a.title || a.ref || "Untitled work item"),
-    h("div", { class: "row" }, loz(MODE_NAME[a.mode], MODE_COLOR[a.mode]), loz(`Phase ${a.phase} of ${a.phases.length} · ${a.phases[a.phase - 1]}`, "gray"), pend ? loz(pend + " needs approval", "yellow") : null),
-    h("div", { class: "workflow", role: "list" }, a.phases.map((t, i) => h("div", { class: "wf " + (i + 1 < a.phase ? "done" : i + 1 === a.phase ? "cur" : ""), role: "listitem", title: t }, `${i + 1}. ${t}`))));
+function drawPanelHeader(v) {
+  const box = $("phdr"); if (!box || !st.ctx) return;
+  const c = st.ctx, iss = issueOf(c.key), a = v && v.active, pend = a ? a.pending_approvals.length : 0;
+  const type = iss ? iss.type : c.type;
+  box.replaceChildren(...[
+    h("div", { class: "toprow" }, type ? loz(type, colorFor(type)) : null,
+      c.key ? (iss ? h("a", { class: "key", href: iss.url, target: "_blank", rel: "noopener noreferrer", title: "Open in Jira" }, c.key) : h("span", { class: "key" }, c.key)) : h("span", { class: "key" }, shortId(c.sid)),
+      h("span", { class: "sp" }), !c.sid ? startBtn() : null,
+      h("button", { class: "subtle", title: "Close", "aria-label": "Close chat panel", onclick: closePanel }, "✕")),
+    h("h2", {}, (a && a.title) || c.title || "New chat"),
+    h("div", { class: "row" }, iss ? loz(iss.status, CAT_COLOR[iss.status_category] || "gray") : null,
+      a ? loz(modeLabel(a.mode), colorFor(a.mode)) : null, a ? loz(`Phase ${a.phase}/${a.phases.length} · ${a.phases[a.phase - 1]}`, "purple") : null, pend ? loz(pend + " needs approval", "yellow") : null,
+      v && v.awaiting_router ? loz("reply “dev” or “support”", "yellow") : null),
+    a ? h("div", { class: "workflow", role: "list" }, a.phases.map((t, i) => h("div", { class: "wf " + (i + 1 < a.phase ? "done" : i + 1 === a.phase ? "cur" : ""), role: "listitem", title: t }, String(i + 1)))) : null].filter(Boolean));
 }
 
 function drawApprovals(v) {
   const box = $("approvals"); if (!box) return; box.replaceChildren();
-  ((v.active && v.active.pending_approvals) || []).forEach((p) => {
+  ((v && v.active && v.active.pending_approvals) || []).forEach((p) => {
     const btn = h("button", { class: "primary", disabled: !p.can_approve || st.busy, title: p.can_approve ? "" : "Your role cannot approve this action", onclick: async () => {
       btn.disabled = true;
-      try { await api(`/sessions/${st.sid}/approvals/${p.id}/grant`, { method: "POST", body: JSON.stringify({ seen_hash: p.hash }) }); addEvent(`You approved “${p.kind}”`); await run(`/sessions/${st.sid}/continue`, {}); }
+      try { await api(`/sessions/${st.ctx.sid}/approvals/${p.id}/grant`, { method: "POST", body: JSON.stringify({ seen_hash: p.hash }) }); addEvent(`You approved “${p.kind}”`); await run(`/sessions/${st.ctx.sid}/continue`, {}); }
       catch (e) { toast(e.message, true); btn.disabled = false; }
     } }, "Approve exactly this");
     box.append(h("div", { class: "card" }, h("h3", {}, "Action required", loz(p.kind.replace(/_/g, " "), "yellow")),
@@ -242,26 +350,47 @@ function drawApprovals(v) {
   });
 }
 
-function drawDetails(v) {
-  const box = $("details"); if (!box) return; const a = v.active;
+function drawPanelDetails(v) {
+  const box = $("pdetails"); if (!box || !st.ctx) return;
+  const a = v && v.active, iss = issueOf(st.ctx.key);
   const sec = (title, ...kids) => h("section", {}, h("h3", {}, title), ...kids);
   const kv = (k, val) => h("div", { class: "kv" }, h("span", { class: "k" }, k), h("span", {}, val));
   const list = (items, empty) => h("ul", { class: "list" }, items.length ? items : h("li", { class: "none" }, empty));
   const out = [];
-  out.push(sec("Details", kv("Mode", a ? loz(MODE_NAME[a.mode], MODE_COLOR[a.mode]) : "—"), kv("Ticket", a?.ref || "—"), kv("Phase", a ? `${a.phase} / ${a.phases.length}` : "—"), kv("Session", shortId(v.id)),
-    kv("Budget", `${v.budget.tool_calls.used} calls · ${v.budget.query_units.used} queries · ${v.budget.tokens.used} tokens`)));
+  if (iss) out.push(sec("Jira ticket", kv("Type", loz(iss.type, colorFor(iss.type))), kv("Status", loz(iss.status, CAT_COLOR[iss.status_category] || "gray")),
+    kv("Priority", iss.priority || "—"), kv("Assignee", iss.assignee || "Unassigned"), kv("Release", (iss.fix_versions || []).join(", ") || "—"),
+    kv("Link", h("a", { href: iss.url, target: "_blank", rel: "noopener noreferrer" }, "Open in Jira"))));
+  else if (st.ctx.key) out.push(sec("Ticket", kv("Key", st.ctx.key), kv("Note", "Not in the current Jira view")));
+  out.push(sec("Supdev", kv("Mode", a ? loz(modeLabel(a.mode), colorFor(a.mode)) : "—"), kv("Phase", a ? `${a.phase} / ${a.phases.length} · ${a.phases[a.phase - 1]}` : "Not started"), kv("Session", v ? shortId(v.id) : "—"),
+    kv("Budget", v ? `${v.budget.tool_calls.used} calls · ${v.budget.query_units.used} queries · ${v.budget.tokens.used} tokens` : "—")));
   if (a && a.mode === "dev") out.push(sec("Requirements", list((a.requirements || []).map((r) => h("li", {}, loz(r.status, r.status === "clear" ? "green" : r.status === "assumed" ? "yellow" : "red"), h("span", {}, `${r.id}: ${r.text}`))), "None recorded yet")));
   if (a && a.mode === "support") out.push(sec("Evidence", list((a.evidence || []).map((x) => h("li", {}, loz(x.id, "blue"), h("span", {}, `${x.source_tool} — ${x.finding}`))), "No evidence yet")));
-  if (v.parked.length) out.push(sec("Parked work items", h("ul", { class: "list" }, v.parked.map((w) => h("li", {}, loz(MODE_NAME[w.mode] || w.mode, MODE_COLOR[w.mode]), h("span", { style: "flex:1" }, w.title || w.id),
-    w.status === "parked" ? h("button", { class: "subtle", onclick: async () => { try { await api(`/sessions/${st.sid}/resume/${w.id}`, { method: "POST" }); await loadItem(true); loadSessions(); } catch (e) { toast(e.message, true); } } }, "Resume") : loz(w.status.replace("_", " "), "purple"))))));
+  if (v && v.parked.length) out.push(sec("Parked work items", h("ul", { class: "list" }, v.parked.map((w) => h("li", {}, loz((modeLabel(w.mode) || w.mode), colorFor(w.mode)), h("span", { style: "flex:1" }, w.title || w.id),
+    w.status === "parked" ? h("button", { class: "subtle", onclick: async () => { try { await api(`/sessions/${st.ctx.sid}/resume/${w.id}`, { method: "POST" }); await loadPanel(true); refreshBoard(); } catch (e) { toast(e.message, true); } } }, "Resume") : loz(w.status.replace("_", " "), "purple"))))));
+  if (!st.ctx.sid) out.push(h("div", { class: "actions" }, startBtn()));
   box.replaceChildren(...out);
+}
+
+// Start = create this ticket's own work item + chat, then let the agent begin (intake and clarification).
+async function startTicket(c) {
+  if (st.starting) return; st.starting = true;
+  const key = c.key || null, title = c.title || key || "New work item";
+  try {
+    const s = await api("/sessions", { method: "POST" });
+    await api(`/sessions/${s.id}/mode`, { method: "POST", body: JSON.stringify({ mode: st.mode, ref: key, title }) });
+    await refreshBoard();
+    await openPanel({ key, title, type: c.type }, s.id);
+    const text = key ? `Start work on ${key}: ${title}` : `Start work: ${title}`;
+    addPost("user", text, Date.now() / 1000);
+    await run(`/sessions/${s.id}/messages`, { text, ref: key, ticket_type: (c.type || "").toLowerCase() || null });
+  } catch (e) { toast(e.message, true); } finally { st.starting = false; }
 }
 
 // ------------------------------------------------------------------------------------------ streaming
 async function send(input) {
-  const text = input.value.trim(); if (!text || st.busy) return;
+  const text = input.value.trim(); if (!text || st.busy || !st.ctx || !st.ctx.sid) return;
   input.value = ""; addPost("user", text, Date.now() / 1000);
-  await run(`/sessions/${st.sid}/messages`, { text });
+  await run(`/sessions/${st.ctx.sid}/messages`, { text });
 }
 async function run(path, body) {
   st.busy = true; const sendBtn = $("send"); if (sendBtn) sendBtn.disabled = true; setTyping(true);
@@ -275,7 +404,7 @@ async function run(path, body) {
       let i; while ((i = buf.search(/\r?\n\r?\n/)) >= 0) { const raw = buf.slice(0, i); buf = buf.slice(i).replace(/^\r?\n\r?\n/, ""); handle(raw); }
     }
   } catch (e) { addEvent(e.message, "err"); }
-  finally { st.busy = false; setTyping(false); const b = $("send"); if (b) b.disabled = false; await loadItem(false); loadSessions(); }
+  finally { st.busy = false; setTyping(false); const b = $("send"); if (b) b.disabled = false; await loadPanel(false); refreshBoard(); }
 }
 function handle(raw) {
   let ev = "message", data = "";
@@ -289,13 +418,16 @@ function handle(raw) {
   else if (ev === "budget_paused") addEvent("Budget reached: " + d.kind + " — a lead/admin must extend it", "flag");
   else if (ev === "stuck") addEvent("Stopped after the same failure 3 times", "flag");
   else if (ev === "phase") addEvent(`Moved to phase ${d.phase}: ${d.title}`);
-  else if (ev === "mode") addEvent(`Started ${MODE_NAME[d.mode] || d.mode} work item`);
+  else if (ev === "mode") addEvent(`Started ${(modeLabel(d.mode) || d.mode)} work item`);
+  else if (ev === "jira_status") { addEvent(d.changed ? `Jira ${d.key}: ${d.from} → ${d.to}` : `Jira ${d.key} stays “${d.from}” (${d.reason})`); if (d.changed) refreshJira(true); }
+  else if (ev === "jira_sync_failed") addEvent(`Couldn't update Jira ${d.key}: ${d.reason}`, "flag");
+  else if (ev === "jira_sync_skipped") addEvent(`Jira ${d.key} not updated: ${d.reason}`, "flag");
   else if (ev === "error") addEvent(d.message, "err");
   if (["tool_call", "assistant", "audit_notice"].includes(ev)) setTyping(true);
 }
 
 // ------------------------------------------------------------------------------------------ create
-function openCreate(preset) {
+function openCreate(preset, prefill) {
   const type = h("select", { id: "c-type" }, h("option", { value: "dev" }, "Development — implement a ticket / story / design"),
     h("option", { value: "support" }, "Support — investigate a production issue"), h("option", { value: "auto" }, "Let Supdev decide"));
   type.value = preset || st.mode;
@@ -308,10 +440,10 @@ function openCreate(preset) {
     if (type.value === "auto" && !summary.value.trim()) { err.textContent = "Add a description so Supdev can pick the mode."; return; }
     go.disabled = true;
     try {
-      const s = await api("/sessions", { method: "POST" }); setState("sid", s.id);
+      const s = await api("/sessions", { method: "POST" });
       const title = summary.value.trim().split("\n")[0].slice(0, 80) || key.value.trim();
       if (type.value !== "auto") { await api(`/sessions/${s.id}/mode`, { method: "POST", body: JSON.stringify({ mode: type.value, ref: key.value.trim() || null, title }) }); setState("mode", type.value); }
-      close(); await show("chat"); loadSessions();
+      close(); await refreshBoard(); await openPanel({ key: key.value.trim() || null, title, type: tt.value }, s.id);
       if (summary.value.trim()) { addPost("user", summary.value.trim(), Date.now() / 1000); await run(`/sessions/${s.id}/messages`, { text: summary.value.trim(), ref: key.value.trim() || null, ticket_type: tt.value || null }); }
     } catch (e) { err.textContent = e.message; go.disabled = false; }
   } }, "Create");
@@ -321,14 +453,22 @@ function openCreate(preset) {
       h("div", { class: "mh" }, h("h2", {}, "Create work item")),
       h("div", { class: "mb" }, f("Work type", type), h("div", { class: "grid2" }, f("Ticket key", key), f("Ticket type", tt)), f("Summary", summary), err),
       h("div", { class: "mf" }, h("button", { class: "subtle", onclick: close }, "Cancel"), go)));
+  if (prefill) { key.value = prefill.key || ""; summary.value = `${prefill.key}: ${prefill.summary}`; const t = (prefill.type || "").toLowerCase(); tt.value = [...tt.options].some((o) => o.value === t) ? t : ""; }
   document.body.append(back); summary.focus();
   back.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
 }
 
 // ------------------------------------------------------------------------------------------ boot
-$("nav-board").onclick = () => show("board");
-$("nav-chat").onclick = () => show("chat");
+$("nav-board").onclick = () => show();
 $("create").onclick = () => openCreate();
-$("search").oninput = renderSidebar;
-document.querySelectorAll("#modeseg button").forEach((b) => (b.onclick = () => { setState("mode", b.dataset.mode); if (st.view === "chat" && st.sid) { setState("sid", null); } show(st.view); }));
-initAuthUI(() => { setState("sid", null); loadSessions(); show(st.view); }).then(async () => { await loadSessions(); await show(st.view); });
+async function loadModes() {
+  try { st.modes = await api("/modes"); } catch (e) { st.modes = []; toast(e.message, true); }
+  if (st.modes.length && !st.modes.some((m) => m.name === st.mode)) setState("mode", st.modes[0].name);
+}
+initAuthUI(() => { closePanel(); loadModes().then(show); }).then(async () => {
+  await loadModes(); await show();
+  if (st.sid && boardData) {  // reopen the ticket chat you had open
+    const c = boardData.cards.find((k) => k.session_id === st.sid), ch = boardData.backlog.find((k) => k.session_id === st.sid);
+    if (c) openCard({ key: c.ref, title: c.title, wi: c, type: "" }); else if (ch) openCard({ key: null, title: ch.title, chat: ch, type: "" }); else setState("sid", null);
+  }
+});

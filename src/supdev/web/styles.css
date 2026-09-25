@@ -146,7 +146,7 @@ table.tags input[type=text],table.tags input:not([type]),table.tags select{min-w
 .seg{display:inline-flex;background:var(--hover);border-radius:var(--rs);padding:2px;gap:2px}
 .seg button{background:none;padding:3px 12px;font-weight:600;color:var(--sub)}
 .seg button:hover{background:none;color:var(--text)}.seg button.on{background:var(--surface);box-shadow:var(--shadow);color:var(--blue-text)}
-.board{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:minmax(232px,1fr);padding-bottom:8px}
+.board{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:minmax(210px,1fr);padding-bottom:8px}
 .col.backlog{background:transparent;border:1px dashed var(--border)}
 .col .empty-col{color:var(--sub);font-size:12px;padding:8px;text-align:center}
 .tile .key{color:var(--sub);font-size:12px;font-weight:600}
@@ -155,7 +155,7 @@ table.tags input[type=text],table.tags input:not([type]),table.tags select{min-w
 /* ---------- sidebar only on Chat; releases rail on Board ---------- */
 .app.nosidebar{grid-template-columns:1fr}.app.nosidebar .sidebar{display:none}
 .page.wide{max-width:none}
-.boardlayout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start;margin-top:16px}
+.boardlayout{display:grid;grid-template-columns:minmax(0,1fr) 270px;gap:16px;align-items:start;margin-top:16px}
 .boardlayout .board{margin-top:0}
 @media(max-width:1100px){.boardlayout{grid-template-columns:1fr}}
 .rail{position:sticky;top:8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);max-height:calc(100vh - 150px);overflow:auto}
@@ -173,3 +173,45 @@ table.tags input[type=text],table.tags input:not([type]),table.tags select{min-w
 .filter select{width:auto;min-width:190px;padding:4px 8px}
 .rel.sel{background:var(--blue-soft);box-shadow:inset 3px 0 0 var(--blue)}
 .rel .relfilter{padding:2px 6px;margin:6px 0 0 -6px;font-size:12px;color:var(--blue-text)}
+
+/* ---------- drag & drop board ---------- */
+.tile.draggable{cursor:grab}.tile.draggable:active{cursor:grabbing}.tile.dragging{opacity:.4}
+.col.over{outline:2px dashed var(--blue);outline-offset:-2px;background:var(--blue-soft)}
+.colbody{min-height:56px}.colhint{margin:-4px 4px 8px;font-size:11px}
+.tile .row{display:flex;gap:6px;align-items:center;margin-bottom:6px}.tile .row .key{margin-left:auto}
+.tile .key{color:var(--sub);font-size:12px;font-weight:600}.tile a.key:hover{color:var(--blue-text)}
+.tile .f .l{flex-wrap:wrap}
+button.small{padding:1px 6px;font-size:12px}.movebtn{color:var(--sub);font-weight:700}
+.avatar.unassigned{background:var(--gray-soft);color:var(--sub)}
+.menu{position:absolute;z-index:70;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-pop);min-width:200px;padding:4px}
+.menu .menuh{font-size:11px;font-weight:700;text-transform:uppercase;color:var(--sub);padding:6px 8px}.menu button{display:block;width:100%;text-align:left}
+.syncinfo{font-size:12px;color:var(--sub)}.syncinfo.bad{color:var(--red)}
+.toolbar .seg button:disabled{opacity:.4}
+.tchips{display:inline-flex;gap:6px;flex-wrap:wrap}
+.tchip{border-radius:99px;background:var(--gray-soft);color:var(--sub);padding:2px 10px;font-weight:600;font-size:12px;border:1px solid transparent}
+.tchip .n{margin-left:6px;background:var(--surface);border-radius:99px;padding:0 6px;font-size:11px}
+.tchip.on{background:var(--blue-soft);color:var(--blue-text);border-color:var(--blue)}.tchip.none{opacity:.55}.tchip:disabled{opacity:.4}
+
+/* ---------- workspace: chat panel (left) + board ---------- */
+.workspace{flex:1;display:flex;min-height:0}
+.workspace > main{flex:1;min-width:0;overflow:auto}
+.chatpanel{width:420px;flex:none;border-right:1px solid var(--border);display:flex;flex-direction:column;background:var(--surface);min-height:0}
+.phead{padding:12px 14px 0;border-bottom:1px solid var(--border);flex:none}
+.phead .toprow{display:flex;align-items:center;gap:8px}.phead .toprow .sp{flex:1}
+.phead h2{font-size:16px;line-height:22px;margin:6px 0 8px}
+.phead .workflow{margin:10px 0 4px}.phead .wf{min-width:0;padding:3px 0;font-size:11px}
+.ptabs{display:flex;gap:2px;margin-top:8px}
+.ptabs button{background:none;border-radius:0;padding:8px 12px;color:var(--sub);border-bottom:3px solid transparent}
+.ptabs button.on{color:var(--blue-text);border-bottom-color:var(--blue)}.ptabs button:hover{background:var(--hover)}
+.pbody{flex:1;overflow:auto;padding:14px}
+.chatpanel .composer{position:static;border-top:1px solid var(--border);padding:10px 14px;background:var(--surface);flex:none}
+.chatpanel .composer textarea{min-height:52px}
+.chatpanel .post .txt{font-size:13px}
+.chatpanel .details section{margin-bottom:12px}
+.pempty{text-align:center;padding:28px 12px;color:var(--sub)}.pempty .btn,.pempty button{margin-top:12px}
+.tile.sel{box-shadow:0 0 0 2px var(--blue),var(--shadow)}
+@media(max-width:900px){.chatpanel{position:fixed;left:0;right:0;top:56px;bottom:0;width:auto;z-index:40}}
+.pdetails{border:1px solid var(--border);border-radius:var(--radius);margin-bottom:14px}
+.pdetails > summary{cursor:pointer;padding:8px 12px;font-weight:600;background:var(--sunken);border-radius:var(--radius);list-style-position:inside}
+.pdetails[open] > summary{border-bottom:1px solid var(--border);border-radius:var(--radius) var(--radius) 0 0}
+.pdetails .details{padding:10px}.pdetails .details section:last-child{margin-bottom:0}
