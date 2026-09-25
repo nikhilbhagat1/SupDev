@@ -118,6 +118,7 @@ class PhaseSpec:
     key: str
     title: str
     exit_check: Callable[[ModeContext], ExitResult]
+    hint: str | None = None  # "work" (work begins) | "review" (out for review): lets Settings suggest Jira statuses BY CATEGORY, never by name
 
 
 @dataclass
@@ -128,6 +129,7 @@ class Denial:
 @runtime_checkable
 class Mode(Protocol):
     name: str
+    label: str  # human name shown in the UI (e.g. "Development")
     prompt_file: str  # filename within supdev/prompts
     router_signals: list[str]  # lower-case substrings that suggest this mode
     ticket_types: set[str]

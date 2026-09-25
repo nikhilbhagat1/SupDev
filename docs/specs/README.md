@@ -14,6 +14,6 @@ Source rule ids (A1–A11, B, C, D, E) refer to `docs/source_system_prompt.md`.
 | 07 | [Templates D1–D3, S1–S2](07-templates.md) | `modes/templates.py` |
 | 08 | [Capabilities & adapters](08-adapters.md) | `capabilities/`, `adapters/` |
 | 09 | [LLM providers](09-llm.md) | `llm/` |
-| 10 | [API & web UI](10-api-web.md) | `api/`, `web/` |
-| 11 | [Admin settings](11-admin-settings.md) | `api/admin.py`, `settings/`, `secrets/db.py`, `auth/token.py`, `web/settings.*` |
+| 10 | [API, board & ticket chat (Jira)](10-api-web.md) | `api/app.py`, `web/` |
+| 11 | [Admin settings (incl. board types, Jira status sync)](11-admin-settings.md) | `api/admin.py`, `settings/`, `secrets/db.py`, `auth/token.py`, `web/settings.*` |
 | 12 | [Docker & deployment](12-docker-deploy.md) | `Dockerfile`, `docker-compose.yml` |

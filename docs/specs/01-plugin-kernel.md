@@ -5,9 +5,9 @@
 **Requirements** Modules are pluggable (user requirement). Bad third-party plugins must not break startup. Duplicates rejected.
 
 **Design** `PluginRegistry` (`plugins/registry.py`) keyed by `PluginKind` = entry-point group (`supdev.llm|capabilities|modes|storage|secrets|audit|auth|redactors`).
-`discover()` loads entry points + `SUPDEV_PLUGINS` dotted paths (`kind:name=pkg.mod:Attr`). `register()` instantiates classes with no args and checks required members per kind (`_REQUIRED`). Failures are collected and logged; `strict=True` raises.
+`discover()` loads entry points + `SUPDEV_PLUGINS` dotted paths (`kind:name=pkg.mod:Attr`). `register()` instantiates classes with no args and checks required members per kind (`_REQUIRED`; a mode must expose `name`, **`label`**, `phases`, `internal_tools`, `check_tool`, `prompt_file`). Failures are collected and logged; `strict=True` raises.
 
-**Interfaces** Protocols in `plugins/base.py`: `LLMProvider`, `CapabilityAdapterFactory`/`CapabilityAdapter`, `Mode`, `SessionStore`, `SecretStore`, `AuditSink`, `Authenticator`, `Redactor`. Capability factory name == tenant integration key.
+**Interfaces** Protocols in `plugins/base.py`: `LLMProvider`, `CapabilityAdapterFactory`/`CapabilityAdapter`, `Mode` (with `PhaseSpec.hint`), `SessionStore`, `SecretStore`, `AuditSink`, `Authenticator`, `Redactor`. Capability factory name == tenant integration key.
 
 **Acceptance → tests** (`tests/unit/test_plugins.py`)
 - built-ins discovered → `test_builtin_plugins_discovered`

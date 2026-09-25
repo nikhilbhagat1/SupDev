@@ -10,5 +10,7 @@
 
 **Also** tenants may come from the settings store (hot reload by version) and the LLM is chosen per tenant (`llm_for`) — see spec 11.
 
+**Jira status sync (opt-in):** when the tenant enables it (Settings → Jira status sync, admin only, off by default), the *engine* — never the model — moves the linked Jira ticket (`work item ref`) after the agent moves the work item **forward** into a mapped phase (`AgentRuntime._sync_jira`; the mapping is **only** what the tenant chose — per-phase lists of THEIR status names, first one the workflow allows wins — so nothing is assumed about a workflow; modes flag phases with `PhaseSpec.hint` (`work` / `review`) purely to help Settings suggest statuses by category). Rules: announced first (`audit_notice`, A9) then audited (`phase_status_sync`); only for roles that may change ticket status; never on `go_back`; never reopens a Done ticket or moves a ticket backwards on the board; workflow transitions only (`JiraAdapter.transition_to_named`); a Jira failure is reported (`jira_sync_failed`) and audited but never blocks the phase change. Tests: `tests/e2e/test_jira_sync.py`, adapter `test_transition_to_named_*`, admin `test_jira_sync_setting_*`.
+
 **Test gaps** No unit tests for `route()` signals/tie/enabled-mode filtering, `parse_choice`, tag enforcement, `resume_work_item`, DEV→SUPPORT switch, token-budget pause, SQLite store round-trip, prompt variable rendering (unknown vars left intact).
 **Out of scope** Multi-session concurrency beyond a per-session lock in the API; streaming tokens (events are per step).

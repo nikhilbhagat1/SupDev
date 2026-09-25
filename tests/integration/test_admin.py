@@ -224,3 +224,111 @@ def test_bootstrap_token_and_tenant_from_env(tmp_path, monkeypatch):
     assert (p.tenant_id, p.role) == ("acme", Role.ADMIN) and rt.tenant_by_id("acme").name == "Acme"
     rt.secrets.set("acme", "x", "some-secret-value")                        # first secret creates the key lazily
     assert oct((tmp_path / "k").stat().st_mode & 0o777) == "0o600"          # generated key file is private
+
+
+# ---- test-before-save + inline validation ---------------------------------------------------
+GH_OK = {"private": True, "default_branch": "main", "permissions": {"push": True}}
+
+
+def test_github_accepts_a_pasted_url_and_test_works_before_saving(w):
+    import httpx
+    import respx
+
+    draft = {"config": {"repo": "https://github.com/o/r.git"}, "secrets": {"token": "draft-token-value"}}
+    with respx.mock:
+        route = respx.get("https://api.github.com/repos/o/r").mock(return_value=httpx.Response(200, json=GH_OK))
+        r = w.client.post("/api/admin/integrations/github/test", headers=w.h(), json=draft).json()
+        assert r["ok"] is True and "token CAN push" in r["results"][0]["detail"]
+        assert route.calls[0].request.headers["authorization"] == "Bearer draft-token-value"     # the typed token was used…
+    assert w.store.get("acme").integrations == {} and w.secrets.names("acme") == {}               # …and NOTHING was saved
+    # saving the same URL now works and stores the normalised name
+    assert w.client.put("/api/admin/integrations/github", headers=w.h(), json=draft).status_code == 200
+    assert w.store.get("acme").integrations["github"]["repo"] == "o/r"
+    # after saving, a blank token box falls back to the stored secret
+    with respx.mock:
+        respx.get("https://api.github.com/repos/o/r").mock(return_value=httpx.Response(200, json=GH_OK))
+        again = w.client.post("/api/admin/integrations/github/test", headers=w.h(),
+                              json={"config": {"repo": "o/r"}, "secrets": {"token": ""}}).json()
+        assert again["ok"] is True
+
+
+def test_test_reports_problems_as_results_not_http_errors_and_guides_when_nothing_saved(w):
+    bad = w.client.post("/api/admin/integrations/github/test", headers=w.h(), json={"config": {"repo": "https://gitlab.com/o/r"}, "secrets": {}})
+    assert bad.status_code == 200 and bad.json()["ok"] is False and "org/name" in bad.json()["results"][0]["detail"]
+    nosecret = w.client.post("/api/admin/integrations/github/test", headers=w.h(), json={"config": {"repo": "o/r"}, "secrets": {}}).json()
+    assert nosecret["ok"] is False and "not configured" in nosecret["results"][0]["detail"]      # missing token is explained
+    none_saved = w.client.post("/api/admin/integrations/github/test", headers=w.h())
+    assert none_saved.status_code == 404 and "before saving" in none_saved.json()["detail"]
+    assert w.client.post("/api/admin/integrations/github/test", headers=w.h("developer"), json={"config": {"repo": "o/r"}}).status_code == 403
+
+
+def test_a_refused_save_explains_why(w):
+    r = w.client.put("/api/admin/integrations/github", headers=w.h(), json={"config": {"repo": "not a repo"}, "secrets": {}})
+    assert r.status_code == 400 and "org/name" in r.json()["detail"]
+
+
+# ---- Jira status sync setting ----------------------------------------------------------------
+def test_jira_sync_setting_is_admin_only_validated_audited_and_off_by_default(w):
+    cfg = w.client.get("/api/admin/config", headers=w.h()).json()
+    assert cfg["tenant"]["jira_sync"] == {} and "default_sync_map" not in cfg["options"]           # no built-in status names
+    assert cfg["options"]["phases"]["dev"][4] == {"title": "Development", "hint": "work"}          # modes say which phase means "work begins"
+    assert cfg["options"]["mode_labels"] == {"dev": "Development", "support": "Support"}
+    body = {"enabled": True, "map": {"dev": {"5": ["In Progress", " Development "], "6": []}}}
+    assert w.client.put("/api/admin/jira-sync", headers=w.h("lead"), json=body).status_code == 403
+    assert w.client.put("/api/admin/jira-sync", headers=w.h("developer"), json=body).status_code == 403
+    r = w.client.put("/api/admin/jira-sync", headers=w.h(), json=body)
+    assert r.status_code == 200
+    saved = w.store.get("acme").jira_sync
+    assert saved == {"enabled": True, "map": {"dev": {"5": ["In Progress", "Development"]}}}          # trimmed; empty phase dropped
+    assert w.rt.tenant_by_id("acme").jira_sync["enabled"] is True                                       # reaches the runtime, no restart
+    assert any(x.kind == "admin_config" and x.action == "jira_sync.update" for x in w.audit.records)
+    for bad in ({"enabled": True, "map": {"nope": {"1": ["x"]}}}, {"enabled": True, "map": {"dev": {"9": ["x"]}}},
+                {"enabled": True, "map": {"dev": {"x": ["x"]}}}, {"enabled": True, "map": {"dev": {"5": ["a"] * 7}}},
+                {"enabled": True, "map": {"dev": {"5": ["x" * 61]}}}):
+        assert w.client.put("/api/admin/jira-sync", headers=w.h(), json=bad).status_code == 400, bad
+    assert w.client.put("/api/admin/jira-sync", headers=w.h(), json={"enabled": False}).status_code == 200
+    assert w.store.get("acme").jira_sync == {"enabled": False, "map": None}                            # None = defaults when re-enabled
+
+
+# ---- nothing about the Jira project is assumed: types/statuses come from Jira; boards are configurable ----
+def _meta_mocks():
+    import httpx
+    import respx
+
+    respx.get("https://j.test/rest/api/3/project/search").mock(return_value=httpx.Response(200, json={"values": [{"key": "OPS", "name": "Ops"}]}))
+    respx.get("https://j.test/rest/api/3/project/OPS").mock(return_value=httpx.Response(200, json={"issueTypes": [
+        {"name": "Story"}, {"name": "Task"}, {"name": "Chore"}, {"name": "Epic", "hierarchyLevel": 1}, {"name": "Sub-task", "subtask": True}]}))
+    respx.get("https://j.test/rest/api/3/project/OPS/statuses").mock(return_value=httpx.Response(200, json=[{"statuses": [
+        {"id": "9", "name": "Shipped", "statusCategory": {"key": "done"}}, {"id": "1", "name": "Todo", "statusCategory": {"key": "new"}},
+        {"id": "2", "name": "Coding", "statusCategory": {"key": "indeterminate"}}]}]))
+    respx.get("https://j.test/rest/agile/1.0/board").mock(return_value=httpx.Response(200, json={"values": []}))
+
+
+def test_jira_meta_lists_the_projects_own_types_and_statuses(w):
+    import respx
+
+    assert w.client.get("/api/admin/jira/meta", headers=w.h()).json() == {"configured": False, "types": [], "statuses": []}
+    w.client.put("/api/admin/integrations/jira", headers=w.h(), json={
+        "config": {"base_url": "https://j.test", "project": "OPS"}, "secrets": {"token": "t", "email": "a@b.c"}})
+    with respx.mock:
+        _meta_mocks()
+        m = w.client.get("/api/admin/jira/meta", headers=w.h("lead")).json()
+    assert m["types"] == ["Chore", "Story", "Task"]                                   # custom type included; epic / sub-task never offered
+    assert [(s["name"], s["category"]) for s in m["statuses"]] == [("Todo", "new"), ("Coding", "indeterminate"), ("Shipped", "done")]      # workflow order, by category
+    assert w.client.get("/api/admin/jira/meta", headers=w.h("developer")).status_code == 403
+
+
+def test_board_types_setting_is_admin_only_validated_audited_and_reaches_the_board(w):
+    assert w.client.get("/api/modes", headers=w.h()).json() == [{"name": "dev", "label": "Development"}, {"name": "support", "label": "Support"}]
+    sid = w.client.post("/api/sessions", headers=w.h()).json()["id"]
+    assert w.client.get("/api/board?mode=dev", headers=w.h()).json()["types"] is None    # default: every type the project has
+    body = {"types": {"dev": ["Story", " Chore "], "support": None}}
+    assert w.client.put("/api/admin/board", headers=w.h("lead"), json=body).status_code == 403
+    assert w.client.put("/api/admin/board", headers=w.h(), json=body).status_code == 200
+    b = w.client.get("/api/board?mode=dev", headers=w.h()).json()
+    assert b["types"] == ["Story", "Chore"] and b["label"] == "Development"                # trimmed; reaches the runtime without restart
+    assert w.client.get("/api/board?mode=support", headers=w.h()).json()["types"] is None
+    assert any(x.kind == "admin_config" and x.action == "board.update" for x in w.audit.records)
+    assert w.client.put("/api/admin/board", headers=w.h(), json={"types": {"nope": ["x"]}}).status_code == 400
+    assert w.client.put("/api/admin/board", headers=w.h(), json={"types": {"dev": ["x" * 61]}}).status_code == 400
+    assert sid

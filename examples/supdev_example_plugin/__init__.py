@@ -39,6 +39,7 @@ class ReviewMode(ModeBase):
     """A one-phase read-only code-review mode, to show that modes are plugins too."""
 
     name = "review"
+    label = "Review"
     prompt_file = "style.md"
     router_signals = ["review this pr", "code review"]
     template_phases: dict[str, set[int]] = {}

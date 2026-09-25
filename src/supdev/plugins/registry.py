@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 _REQUIRED: dict[PluginKind, tuple[str, ...]] = {
     PluginKind.LLM: ("name", "complete"),
     PluginKind.CAPABILITY: ("create",),
-    PluginKind.MODE: ("name", "phases", "internal_tools", "check_tool", "prompt_file"),
+    PluginKind.MODE: ("name", "label", "phases", "internal_tools", "check_tool", "prompt_file"),
     PluginKind.STORAGE: ("save", "get", "list"),
     PluginKind.SECRETS: ("get",),
     PluginKind.AUDIT: ("write", "query"),

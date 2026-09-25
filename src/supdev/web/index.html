@@ -10,12 +10,9 @@
 <header class="topnav">
   <a class="logo" href="/"><span class="logomark">S</span>Supdev</a>
   <button class="navlink" id="nav-board">Board</button>
-  <button class="navlink" id="nav-chat">Chat</button>
   <a class="navlink" href="/settings">Settings</a>
   <div class="spacer"></div>
-  <div class="seg" id="modeseg" role="tablist" aria-label="Mode">
-    <button data-mode="dev" role="tab">Development</button><button data-mode="support" role="tab">Support</button>
-  </div>
+  <div class="seg" id="modeseg" role="tablist" aria-label="Mode"></div>
   <button id="create" class="primary">＋ Create</button>
   <div class="popwrap">
     <button id="avatar" class="avatar" aria-label="Account">?</button>
@@ -30,12 +27,8 @@
     </div>
   </div>
 </header>
-<div class="app">
-  <aside class="sidebar">
-    <input id="search" class="search" type="search" placeholder="Search work items" aria-label="Search work items">
-    <h4 id="listtitle">Work items</h4>
-    <div id="wilist"></div>
-  </aside>
+<div class="workspace">
+  <aside id="chatpanel" class="chatpanel" aria-label="Ticket chat" hidden></aside>
   <main><div id="content"></div></main>
 </div>
 <div id="toasts" class="toasts"></div>

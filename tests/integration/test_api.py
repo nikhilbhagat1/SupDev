@@ -94,12 +94,15 @@ def test_releases_endpoint_states(client_env, monkeypatch):
                                 EnvSecretStore({("acme", "jira_token"): "t", ("acme", "jira_email"): "a@b.c"}))[0]
     e.adapters.append(jira)
     with respx.mock:
+        respx.get("https://j.test/rest/api/3/project/search").mock(return_value=httpx.Response(200, json={
+            "values": [{"key": "OPS", "name": "Operations"}]}))
         route = respx.get("https://j.test/rest/api/3/project/OPS/versions").mock(return_value=httpx.Response(200, json=[
             {"id": "2", "name": "2.0", "released": False, "releaseDate": "2026-12-01",
              "description": "ships with key ghp_" "abcdefghijklmnopqrstuvwx"}]))
         respx.get("https://j.test/rest/api/3/version/2/unresolvedIssueCount").mock(
             return_value=httpx.Response(200, json={"issuesCount": 4, "issuesUnresolvedCount": 1}))
         r = c.get("/api/releases", headers=H).json()
+        assert r["manage_url"] == "https://j.test/projects/OPS/versions"
         assert r["project"] == "OPS" and r["releases"][0]["done"] == 3 and "ghp_" not in str(r)   # redacted
         c.get("/api/releases", headers=H)
         assert route.call_count == 1                                                            # cached 60s
@@ -107,5 +110,78 @@ def test_releases_endpoint_states(client_env, monkeypatch):
             "issues": [{"key": "OPS-1"}]}))
         assert c.get("/api/releases/2/issues", headers=H).json()["keys"] == ["OPS-1"]
         assert c.get("/api/releases/2%20OR%201=1/issues", headers=H).status_code == 400
-        respx.get("https://j.test/rest/api/3/project/BAD/versions").mock(return_value=httpx.Response(404, text="nope"))
-        assert c.get("/api/releases?project=BAD", headers=H).status_code == 502
+        respx.get("https://j.test/rest/api/3/project/search").mock(return_value=httpx.Response(200, json={"values": []}))
+        bad = c.get("/api/releases?project=BAD", headers=H)
+        assert bad.status_code == 502 and "Use the project KEY" in bad.json()["detail"]
+
+
+def test_issues_endpoint_states_and_redaction(client_env, monkeypatch):
+    import httpx
+    import respx
+
+    from supdev.adapters.jira import JiraFactory
+    from supdev.plugins.base import TenantConfig
+    from supdev.secrets.env import EnvSecretStore
+
+    monkeypatch.setenv("SUPDEV_ALLOW_PRIVATE_URLS", "1")
+    monkeypatch.setenv("SUPDEV_ALLOW_HTTP", "1")
+    c, e = client_env
+    assert c.get("/api/issues", headers=H).json() == {"configured": False, "issues": []}
+    e.adapters.append(JiraFactory().create(TenantConfig("acme", {"jira": {"base_url": "https://j.test", "project": "OPS"}}),
+                                           EnvSecretStore({("acme", "jira_token"): "t", ("acme", "jira_email"): "a@b.c"}))[0])
+    with respx.mock:
+        respx.get("https://j.test/rest/api/3/project/search").mock(return_value=httpx.Response(200, json={
+            "values": [{"key": "OPS", "name": "Operations"}]}))
+        respx.get("https://j.test/rest/agile/1.0/board").mock(return_value=httpx.Response(200, json={"values": []}))
+        respx.get("https://j.test/rest/api/3/project/OPS/statuses").mock(return_value=httpx.Response(200, json=[]))
+        respx.get("https://j.test/rest/api/3/search/jql").mock(return_value=httpx.Response(200, json={"issues": [
+            {"key": "OPS-1", "fields": {"summary": "Rotate key ghp_" "abcdefghijklmnopqrstuvwx", "issuetype": {"name": "Task"},
+                                         "status": {"name": "To Do", "statusCategory": {"key": "new"}}}}]}))
+        r = c.get("/api/issues", headers=H).json()
+        assert r["project"] == "OPS" and r["issues"][0]["type"] == "Task" and "ghp_" not in str(r)
+
+
+def test_issue_move_endpoint_roles_audit_and_cache(client_env, monkeypatch):
+    import httpx
+    import respx
+
+    from supdev.adapters.jira import JiraFactory
+    from supdev.plugins.base import TenantConfig
+    from supdev.secrets.env import EnvSecretStore
+
+    monkeypatch.setenv("SUPDEV_ALLOW_PRIVATE_URLS", "1")
+    monkeypatch.setenv("SUPDEV_ALLOW_HTTP", "1")
+    c, e = client_env
+    e.adapters.append(JiraFactory().create(TenantConfig("acme", {"jira": {"base_url": "https://j.test", "project": "OPS"}}),
+                                           EnvSecretStore({("acme", "jira_token"): "t", ("acme", "jira_email"): "a@b.c"}))[0])
+    viewer, dev = {**H, "X-Role": "viewer"}, {**H, "X-Role": "developer"}
+    with respx.mock:
+        respx.get("https://j.test/rest/api/3/project/search").mock(return_value=httpx.Response(200, json={"values": [{"key": "OPS", "name": "Ops"}]}))
+        respx.get("https://j.test/rest/agile/1.0/board").mock(return_value=httpx.Response(200, json={"values": []}))
+        respx.get("https://j.test/rest/api/3/project/OPS/statuses").mock(return_value=httpx.Response(200, json=[
+            {"statuses": [{"id": "1", "name": "To Do", "statusCategory": {"key": "new"}}, {"id": "3", "name": "Done", "statusCategory": {"key": "done"}}]}]))
+        issues = respx.get("https://j.test/rest/api/3/search/jql").mock(return_value=httpx.Response(200, json={"issues": [
+            {"key": "OPS-1", "fields": {"summary": "s", "issuetype": {"name": "Task"}, "status": {"id": "1", "name": "To Do", "statusCategory": {"key": "new"}}}}]}))
+        respx.get("https://j.test/rest/api/3/issue/OPS-1").mock(return_value=httpx.Response(200, json={"fields": {"status": {"id": "1", "name": "To Do"}}}))
+        respx.get("https://j.test/rest/api/3/issue/OPS-1/transitions").mock(return_value=httpx.Response(200, json={"transitions": [{"id": "9", "to": {"id": "3", "name": "Done"}}]}))
+        post = respx.post("https://j.test/rest/api/3/issue/OPS-1/transitions").mock(return_value=httpx.Response(204))
+        board = c.get("/api/issues", headers=dev).json()
+        assert [x["name"] for x in board["columns"]] == ["To Do", "Done"] and board["issues"][0]["status_id"] == "1" and board["can_move"] is True
+        assert c.get("/api/issues", headers=viewer).json()["can_move"] is False                # UI can disable dragging
+        assert c.post("/api/issues/OPS-1/move", headers=viewer, json={"status_ids": ["3"]}).status_code == 403
+        assert not post.called
+        assert c.post("/api/issues/OPS-1/move", headers=dev, json={"status_ids": ["3; x"]}).status_code == 400
+        r = c.post("/api/issues/OPS-1/move", headers=dev, json={"status_ids": ["3"]})
+        assert r.status_code == 200 and r.json()["status"] == "Done" and post.call_count == 1
+        c.get("/api/issues", headers=dev)
+        assert issues.call_count >= 2                                                          # cache dropped after a move
+        assert c.post("/api/issues/OTHER-1/move", headers=dev, json={"status_ids": ["3"]}).status_code == 502
+    moves = [r for r in e.audit.records if r.kind == "ui_ticket_move"]
+    assert len(moves) == 1 and moves[0].user_id == "u1" and moves[0].detail["to"] == "Done"
+
+
+def test_ui_files_are_revalidated_not_served_stale(client_env):
+    c, _ = client_env
+    for path in ("/", "/settings", "/static/app.js", "/static/styles.css"):
+        assert c.get(path).headers["cache-control"] == "no-cache", path
+    assert "cache-control" not in c.get("/api/health").headers or "no-cache" not in c.get("/api/health").headers["cache-control"]

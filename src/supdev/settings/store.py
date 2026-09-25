@@ -41,6 +41,8 @@ class TenantDoc(BaseModel):
     policy: PolicyDoc = Field(default_factory=PolicyDoc)
     llm: LLMDoc = Field(default_factory=LLMDoc)
     integrations: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    board: dict[str, Any] = Field(default_factory=dict)  # {"types": {mode: [issue type names] | None}}
+    jira_sync: dict[str, Any] = Field(default_factory=dict)  # {enabled: bool, map: {mode: {"<phase#>": [status names]}} | None}
     version: int = 0
 
 
@@ -109,5 +111,5 @@ class SettingsStore:
         return TenantSetup(
             tenant_id=d.id, name=d.name or d.id, policy=policy_from_doc(d.policy), integrations=d.integrations,
             environments=d.environments, timezone=d.timezone, repo_context=d.repo_context,
-            conventions=d.conventions, service_catalog=d.service_catalog, version=d.version,
+            conventions=d.conventions, service_catalog=d.service_catalog, version=d.version, jira_sync=d.jira_sync, board=d.board,
             llm=d.llm.model_dump(exclude_none=True))

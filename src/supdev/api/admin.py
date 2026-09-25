@@ -52,6 +52,20 @@ class DiscoverIn(BaseModel):
     secrets: dict[str, str] = Field(default_factory=dict)
 
 
+class TestIn(BaseModel):
+    config: dict[str, Any] | None = None  # draft form values; omitted => test what is saved
+    secrets: dict[str, str] = Field(default_factory=dict)
+
+
+class SyncIn(BaseModel):
+    enabled: bool
+    map: dict[str, dict[str, list[str]]] | None = None  # {mode: {"<phase number>": [status names, first available wins]}}; None = defaults
+
+
+class BoardIn(BaseModel):
+    types: dict[str, list[str] | None]  # {mode: [Jira issue type names] | None (= every type the project has)}
+
+
 class TokenIn(BaseModel):
     user_id: str = Field(min_length=1, max_length=80)
     role: Role
@@ -115,6 +129,9 @@ def build_router(rt: AgentRuntime, who: Callable[..., Principal]) -> APIRouter:
                 "integrations": V.INTEGRATIONS, "capabilities": V.CAPABILITIES,
                 "access": [a.value for a in Access], "approval_kinds": [k.value for k in ApprovalKind],
                 "modes": rt.registry.names(PluginKind.MODE), "llm_providers": rt.registry.names(PluginKind.LLM),
+                "phases": {m: [{"title": ph.title, "hint": ph.hint} for ph in rt.registry.get(PluginKind.MODE, m).phases()]
+                           for m in rt.registry.names(PluginKind.MODE)},
+                "mode_labels": {m: rt.registry.get(PluginKind.MODE, m).label for m in rt.registry.names(PluginKind.MODE)},
                 "roles": [x.value for x in Role]},
             "platform": {"stdio_mcp_allowed": flags.allow_stdio_mcp(), "local_exec_allowed": flags.allow_local_exec(),
                          "private_urls_allowed": flags.allow_private_urls(),
@@ -154,6 +171,63 @@ def build_router(rt: AgentRuntime, who: Callable[..., Principal]) -> APIRouter:
             raise HTTPException(400, "budget values must be positive")
         update(p, lambda d: setattr(d, "policy", body))  # merged with platform policy at use → can only tighten
         audit(p, "policy.update", {"policy": body.model_dump()})
+        return masked(p)
+
+    # ------------------------------------------------------------ Jira status sync (phase -> ticket status)
+    @r.put("/jira-sync")
+    def put_sync(body: SyncIn, p: Principal = Depends(admin)) -> dict[str, Any]:
+        """Turning this on authorises the ENGINE to move the linked Jira ticket whenever the agent moves a work item forward into a
+        mapped phase. Off by default; audited; the Jira workflow still decides what is possible."""
+        clean: dict[str, dict[str, list[str]]] | None = None
+        if body.map is not None:
+            clean = {}
+            for mode_name, rows in body.map.items():
+                if mode_name not in rt.registry.names(PluginKind.MODE):
+                    raise HTTPException(400, f"unknown mode '{mode_name}'")
+                n_phases = len(rt.registry.get(PluginKind.MODE, mode_name).phases())
+                clean[mode_name] = {}
+                for phase, names in rows.items():
+                    if not phase.isdigit() or not 1 <= int(phase) <= n_phases:
+                        raise HTTPException(400, f"{mode_name}: phase must be 1–{n_phases}")
+                    names = [n.strip() for n in names if n and n.strip()]
+                    if len(names) > 6 or any(len(n) > 60 or any(ord(c) < 32 for c in n) for n in names):
+                        raise HTTPException(400, f"{mode_name} phase {phase}: give up to 6 short status names")
+                    if names:
+                        clean[mode_name][phase] = names
+        doc = {"enabled": body.enabled, "map": clean}
+        update(p, lambda d: setattr(d, "jira_sync", doc))
+        audit(p, "jira_sync.update", {"enabled": body.enabled, "map": clean})
+        return masked(p)
+
+    # -------------------------------------------------------------- what the Jira project really has
+    @r.get("/jira/meta")
+    async def jira_meta(p: Principal = Depends(viewer)) -> dict[str, Any]:
+        """Issue types and statuses (with category, in board order) of the configured Jira project — the only source for the
+        board's type choices and the status-sync pickers, so no type or status name is assumed anywhere in the product."""
+        adapter = next((a for a in rt.adapters_for(rt._tenant(p)) if hasattr(a, "project_meta")), None)
+        if adapter is None:
+            return {"configured": False, "types": [], "statuses": []}
+        try:
+            return {"configured": True, **await asyncio.wait_for(adapter.project_meta(), 25)}
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, rt.redactor.redact(getattr(exc, "message", None) or str(exc))[0][:300]) from exc
+
+    # -------------------------------------------------------------------- which issue types each board shows
+    @r.put("/board")
+    def put_board(body: BoardIn, p: Principal = Depends(admin)) -> dict[str, Any]:
+        clean: dict[str, list[str] | None] = {}
+        for mode_name, names in body.types.items():
+            if mode_name not in rt.registry.names(PluginKind.MODE):
+                raise HTTPException(400, f"unknown mode '{mode_name}'")
+            if names is None:
+                clean[mode_name] = None
+                continue
+            names = [n.strip() for n in names if n and n.strip()]
+            if len(names) > 30 or any(len(n) > 60 or any(ord(c) < 32 for c in n) for n in names):
+                raise HTTPException(400, f"{mode_name}: up to 30 short issue type names")
+            clean[mode_name] = names
+        update(p, lambda d: setattr(d, "board", {"types": clean}))
+        audit(p, "board.update", {"types": clean})
         return masked(p)
 
     # -------------------------------------------------------------------------- LLM
@@ -207,14 +281,27 @@ def build_router(rt: AgentRuntime, who: Callable[..., Principal]) -> APIRouter:
         return masked(p)
 
     @r.post("/integrations/{name}/test")
-    async def test_integration(name: str, p: Principal = Depends(admin)) -> dict[str, Any]:
-        d = store.get(p.tenant_id)
-        if d is None or name not in d.integrations:
-            raise HTTPException(404, "integration not configured")
+    async def test_integration(name: str, body: TestIn | None = None, p: Principal = Depends(admin)) -> dict[str, Any]:
+        """Test the form as typed (nothing is saved) or, with no body, the saved configuration. A blank secret field falls back
+        to the stored secret, so you can test without re-typing credentials."""
         results: list[dict[str, Any]] = []
         try:
+            if body is not None and body.config is not None:
+                if name not in V.VALIDATORS:
+                    raise HTTPException(404, "unknown integration")
+                cfg, writes = V.VALIDATORS[name](body.config, body.secrets)
+                store_view: Any = OverlaySecrets(secrets, writes)
+            else:
+                d = store.get(p.tenant_id)
+                if d is None or name not in d.integrations:
+                    raise HTTPException(404, "integration not configured — fill in the form and press Test to try it before saving")
+                cfg, store_view = d.integrations[name], secrets
             factory = rt.registry.get(PluginKind.CAPABILITY, name)
-            adapters = factory.create(TenantConfig(p.tenant_id, {name: d.integrations[name]}), secrets)
+            adapters = factory.create(TenantConfig(p.tenant_id, {name: cfg}), store_view)
+        except SupdevError as exc:
+            return {"ok": False, "results": [{"ok": False, "detail": str(exc)[:300]}]}
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "results": [{"ok": False, "detail": rt.redactor.redact(str(exc))[0][:300]}]}
         for ad in adapters:
@@ -224,7 +311,7 @@ def build_router(rt: AgentRuntime, who: Callable[..., Principal]) -> APIRouter:
                 results.append({"adapter": label, "ok": True, "detail": detail})
             except Exception as exc:  # noqa: BLE001
                 results.append({"adapter": label, "ok": False,
-                                "detail": rt.redactor.redact(f"{type(exc).__name__}: {exc}")[0][:300]})
+                                "detail": rt.redactor.redact(f"{getattr(exc, 'message', None) or exc}")[0][:300]})
         return {"ok": all(x["ok"] for x in results), "results": results}
 
     # -------------------------------------------------------------------------- MCP
