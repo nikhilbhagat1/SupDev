@@ -12,8 +12,12 @@
 | A9 audit | hash-chained append-only records; "will write X to Y" notice before every write | `test_audit_chain_detects_tampering` |
 | A11 prod read-only | gateway hard stop before any approval logic | `test_prod_write_denied_even_with_matching_approval_record` |
 | DEV guardrails | protected branches, no force, CI/dependency files need own approval, commits local until PR approval | `test_ci_and_dependency…`, git adapter test |
-
 | Admin/config safety | encrypted write-only secrets, hashed tokens, operator flags, SSRF guard, MCP tag validation, audited changes | `tests/integration/test_admin.py` |
+| Board drag-and-drop → Jira | direct human action: role-checked against `ticket_status` approvers, project-scoped, transitions only, audited | `test_issue_move_endpoint_roles_audit_and_cache`, `test_jira_move_issue_uses_workflow_transitions_only` |
+| Phase → Jira status sync | opt-in per tenant by an admin (standing authorisation), engine-driven, announced + audited, role-checked, transitions only, never backwards/reopen, never blocks the workflow | `tests/e2e/test_jira_sync.py` |
+
+| Secrets stay out of git | `.gitignore` covers the DB/WAL, audit log, master key, `.env`, `.secrets/`; a local pre-commit hook blocks them even when force-added; test fixtures split fake tokens so scanners don't flag them | manual + `git log` scans |
+| Redaction doesn't destroy evidence | phone numbers only match structured forms, cards need a Luhn check | `test_redaction_keeps_dates_timestamps_ips_and_ids` |
 
 ## Known limits (be honest about them)
 * `dev-header` auth is for local use only (the server refuses non-loopback binds with it). `token` auth is the minimum for shared use; plug in OIDC via the `supdev.auth` group for SSO.
@@ -23,5 +27,6 @@
   advance gates, and every write is gated.
 * `local_exec` runs repository code on the platform host — run the platform in a sandbox without ambient credentials.
 * Regex redaction is best-effort; add a stronger `supdev.redactors` plugin (e.g. a DLP service) for regulated data.
+* Jira status sync and board drag-and-drop write to Jira with the *integration's* credentials (not the user's own Jira identity), so Jira shows the integration account as the actor; the audit log records which Supdev user caused each move.
 * The prod check trusts the adapter's environment tag. Review adapter/MCP configs; untagged MCP tools are never exposed.
 * Approvals by chat text map to the single pending request; the UI button (with `seen_hash`) is the precise path.
