@@ -25,7 +25,7 @@ def principal(role: Role = Role.LEAD, tenant: str = "acme", user: str = "u1") ->
 
 
 class Env:
-    def __init__(self, script, adapters=None, envs=("dev", "staging"), tenant_policy=None):
+    def __init__(self, script, adapters=None, envs=("dev", "staging"), tenant_policy=None, jira_sync=None):
         self.llm = FakeLLM(script)
         self.tk, self.sc, self.ex, self.docs = fake_ticketing({"T-1": {"key": "T-1", "type": "Story"}}), \
             fake_source_control(), fake_execution(), fake_docs()
@@ -35,7 +35,7 @@ class Env:
         self.rt = AgentRuntime(default_registry(), llm=self.llm, store=MemorySessionStore(),
                                audit=self.audit, secrets=EnvSecretStore(), redactor=RegexRedactor())
         kw = {"policy": tenant_policy} if tenant_policy else {}
-        self.rt.add_tenant(TenantSetup("acme", "Acme", adapters=self.adapters, environments=list(envs), **kw))
+        self.rt.add_tenant(TenantSetup("acme", "Acme", adapters=self.adapters, environments=list(envs), jira_sync=jira_sync or {}, **kw))
         self.rt.add_tenant(TenantSetup("globex", "Globex", adapters=[], environments=["dev"]))
         self.p = principal()
         self.sid = self.rt.create_session(self.p).id
