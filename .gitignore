@@ -20,3 +20,8 @@ master.key
 .env
 .env.*
 !.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
