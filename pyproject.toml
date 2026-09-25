@@ -1,0 +1,85 @@
+[project]
+name = "supdev"
+version = "0.1.0"
+description = "Unified engineering agent (DEV + SUPPORT/RCA) with pluggable modes, integrations and LLM providers"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.8",
+  "jinja2>=3.1",
+  "httpx>=0.27",
+  "anthropic>=0.40",
+  "mcp>=1.0",
+  "sse-starlette>=2.1",
+  "cryptography>=50.0.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "respx>=0.21"]
+
+[project.scripts]
+supdev = "supdev.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/supdev"]
+
+# Built-in plugins register through the same entry points third parties use.
+[project.entry-points."supdev.llm"]
+fake = "supdev.llm.fake:FakeLLM"
+anthropic = "supdev.llm.anthropic:AnthropicLLM"
+
+[project.entry-points."supdev.modes"]
+dev = "supdev.modes.dev:DevMode"
+support = "supdev.modes.support:SupportMode"
+
+[project.entry-points."supdev.capabilities"]
+fake = "supdev.adapters.fake:FakeAdapterFactory"
+github = "supdev.adapters.github:GitHubFactory"
+jira = "supdev.adapters.jira:JiraFactory"
+grafana = "supdev.adapters.observability:GrafanaFactory"
+loki = "supdev.adapters.observability:LokiFactory"
+rancher = "supdev.adapters.observability:RancherFactory"
+figma = "supdev.adapters.figma:FigmaFactory"
+local_exec = "supdev.adapters.local_exec:LocalExecFactory"
+mcp = "supdev.adapters.mcp_bridge:McpFactory"
+
+[project.entry-points."supdev.storage"]
+sqlite = "supdev.storage.sqlite:SqliteSessionStore"
+memory = "supdev.storage.memory:MemorySessionStore"
+
+[project.entry-points."supdev.secrets"]
+env = "supdev.secrets.env:EnvSecretStore"
+db = "supdev.secrets.db:DbSecretStore"
+
+[project.entry-points."supdev.audit"]
+jsonl = "supdev.core.audit:JsonlAuditSink"
+memory = "supdev.core.audit:MemoryAuditSink"
+
+[project.entry-points."supdev.auth"]
+dev-header = "supdev.auth.dev_header:DevHeaderAuth"
+token = "supdev.auth.token:TokenAuth"
+
+[project.entry-points."supdev.redactors"]
+regex = "supdev.core.redaction:RegexRedactor"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "E702", "E731", "B008"]  # B008: FastAPI Depends() idiom  # style: long lines/semicolons tolerated in tests and templates
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/supdev/core", "src/supdev/gateway", "src/supdev/plugins"]
+plugins = ["pydantic.mypy"]
