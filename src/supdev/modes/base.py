@@ -39,6 +39,7 @@ def fail(msg: str) -> InternalResult:
 
 class ModeBase:
     name = ""
+    label = ""
     prompt_file = ""
     router_signals: list[str] = []
     ticket_types: set[str] = set()

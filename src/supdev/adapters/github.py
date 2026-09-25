@@ -41,8 +41,22 @@ class GitHubAdapter:
         return cap.source_control("github")
 
     async def ping(self) -> str:
-        d = await self.api.request("GET", f"/repos/{self.repo}")
-        return f"repo reachable (default branch {d.get('default_branch')}, {'private' if d.get('private') else 'public'})"
+        try:
+            d = await self.api.request("GET", f"/repos/{self.repo}")
+        except SupdevError as exc:
+            m = str(exc)
+            if "HTTP 404" in m:
+                raise SupdevError(f"repository '{self.repo}' was not found — check the name, or (for a private repo) that the token "
+                                  "has access to it") from exc
+            if "HTTP 401" in m:
+                raise SupdevError("GitHub rejected the token (expired or wrong) — create a new one and save it") from exc
+            raise
+        push = (d.get("permissions") or {}).get("push")
+        msg = f"repo reachable ({'private' if d.get('private') else 'public'}, default branch {d.get('default_branch')}); "
+        msg += "token CAN push" if push else "token can NOT push — give it Contents: read & write on this repo"
+        if d.get("default_branch") and d["default_branch"] != self.default_branch:
+            msg += f" · note: saved default branch is '{self.default_branch}'"
+        return msg
 
     async def call(self, tool: str, a: dict[str, Any]) -> Any:
         return await getattr(self, f"_{tool.split('.', 1)[1]}")(a)

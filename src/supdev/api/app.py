@@ -15,9 +15,10 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from ..core.approvals import ApprovalService
+from ..core.audit import AuditRecord
 from ..core.errors import ApprovalError, PolicyViolation, SupdevError
 from ..core.events import Event
-from ..core.models import Principal, Session
+from ..core.models import ApprovalKind, Principal, Session
 from ..core.runtime import AgentRuntime
 from ..plugins.base import Authenticator, PluginKind
 from .config import build_runtime
@@ -39,6 +40,10 @@ class ModeIn(BaseModel):
     mode: str
     ref: str | None = None
     title: str = ""
+
+
+class MoveIn(BaseModel):
+    status_ids: list[str]
 
 
 class BudgetIn(BaseModel):
@@ -155,6 +160,12 @@ def create_app(runtime: AgentRuntime | None = None, auth: Authenticator | None =
             out.append(item)
         return out
 
+    @app.get("/api/modes")
+    def modes(p: Principal = Depends(who)) -> list[dict[str, str]]:
+        """Modes this tenant may use, straight from the plugin registry (so a new mode plugin appears without UI changes)."""
+        enabled = rt.policy_for(rt._tenant(p)).enabled_modes
+        return [{"name": n, "label": m.label} for n, m in sorted(rt.modes().items()) if enabled is None or n in enabled]
+
     @app.get("/api/board")
     def board(mode: str, p: Principal = Depends(who)) -> dict[str, Any]:
         """Kanban data for one mode: a column per workflow phase; cards are that mode's work items (own sessions).
@@ -177,7 +188,9 @@ def create_app(runtime: AgentRuntime | None = None, auth: Authenticator | None =
                 cards.append({"session_id": s.id, "work_item_id": wi.id, "title": (wi.title or wi.ref or "Untitled")[:80],
                               "ref": wi.ref, "phase": wi.phase + 1, "status": "active" if wi is s.active else wi.status,
                               "pending": len(svc.pending(wi)), "created_at": s.created_at})
-        return {"mode": mode, "phases": phases, "cards": cards, "backlog": backlog}
+        configured = ((rt._tenant(p).board or {}).get("types") or {}).get(mode)  # None => show every issue type the project has
+        return {"mode": mode, "label": rt.registry.get(PluginKind.MODE, mode).label, "phases": phases, "cards": cards,
+                "backlog": backlog, "types": configured}
 
     releases_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
@@ -190,18 +203,67 @@ def create_app(runtime: AgentRuntime | None = None, auth: Authenticator | None =
         key = project or getattr(adapter, "project", None)
         if not key:
             return {"configured": True, "project": None, "releases": []}
-        ck = (p.tenant_id, key.upper())
+        ck = (p.tenant_id, key.lower())
         hit = releases_cache.get(ck)
         if hit and not refresh and time.time() - hit[0] < 60:
             return hit[1]
         try:
-            items = await asyncio.wait_for(adapter.releases(key), 25)
+            res = await asyncio.wait_for(adapter.releases(key), 25)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, rt.redactor.redact(getattr(exc, "message", None) or str(exc))[0][:300]) from exc
         clean = [{**it, "name": rt.redactor.redact(str(it["name"]))[0],  # external free text: redact before the browser
-                  "description": rt.redactor.redact(str(it["description"]))[0]} for it in items]
-        out = {"configured": True, "project": key.upper(), "releases": clean}
+                  "description": rt.redactor.redact(str(it["description"]))[0]} for it in res["releases"]]
+        out = {"configured": True, "project": res["project"], "releases": clean,
+               "manage_url": f"{adapter.http.base_url}/projects/{res['project']}/versions"}
         releases_cache[ck] = (time.time(), out)
+        return out
+
+    @app.get("/api/issues")
+    async def issues(project: str | None = None, include_done: bool = False, refresh: bool = False,
+                     p: Principal = Depends(who)) -> dict[str, Any]:
+        """Jira tasks/stories/bugs for the board (read-only, tenant's own Jira, cached 60 s, free text redacted)."""
+        adapter = next((a for a in rt.adapters_for(rt._tenant(p)) if hasattr(a, "issues")), None)
+        if adapter is None:
+            return {"configured": False, "issues": []}
+        key = project or getattr(adapter, "project", None)
+        if not key:
+            return {"configured": True, "project": None, "issues": []}
+        can_move = rt.policy_for(rt._tenant(p)).can_approve(p.role, ApprovalKind.TICKET_STATUS)  # per user: never cached
+        ck = (p.tenant_id, f"issues:{key.lower()}:{include_done}")
+        hit = releases_cache.get(ck)
+        if hit and not refresh and time.time() - hit[0] < 60:
+            return {**hit[1], "can_move": can_move}
+        try:
+            res = await asyncio.wait_for(adapter.issues(key, include_done), 25)
+            columns = await asyncio.wait_for(adapter.board_columns(key), 25)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, rt.redactor.redact(getattr(exc, "message", None) or str(exc))[0][:300]) from exc
+        for it in res["issues"]:  # external free text: redact before it reaches the browser
+            it["summary"] = rt.redactor.redact(it["summary"])[0]
+        out = {"configured": True, **res, "columns": columns}
+        releases_cache[ck] = (time.time(), out)
+        return {**out, "can_move": can_move}
+
+    @app.post("/api/issues/{issue_key}/move")
+    async def move_issue(issue_key: str, body: MoveIn, p: Principal = Depends(who)) -> dict[str, Any]:
+        """Drag-and-drop on the board = a Jira workflow transition performed by the signed-in human. Needs the same role
+        that may approve ticket-status changes; audited; the Jira workflow decides what is allowed."""
+        if not rt.policy_for(rt._tenant(p)).can_approve(p.role, ApprovalKind.TICKET_STATUS):
+            raise HTTPException(403, f"role '{p.role.value}' cannot change ticket status")
+        adapter = next((a for a in rt.adapters_for(rt._tenant(p)) if hasattr(a, "move_issue")), None)
+        if adapter is None:
+            raise HTTPException(404, "Jira is not connected")
+        if not body.status_ids or len(body.status_ids) > 10 or not all(s.isdigit() and len(s) < 12 for s in body.status_ids):
+            raise HTTPException(400, "invalid target column")
+        try:
+            out = await asyncio.wait_for(adapter.move_issue(issue_key.upper(), body.status_ids), 25)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(409 if "workflow" in str(exc) else 502,
+                                rt.redactor.redact(getattr(exc, "message", None) or str(exc))[0][:300]) from exc
+        for k in [k for k in releases_cache if k[0] == p.tenant_id and str(k[1]).startswith("issues:")]:
+            releases_cache.pop(k, None)  # next board load re-reads Jira
+        rt.audit.write(AuditRecord(tenant_id=p.tenant_id, session_id="-", user_id=p.user_id, kind="ui_ticket_move",
+                                   system="ticketing", action=f"move {out['key']}", detail={"to": out["status"], "changed": out["changed"]}))
         return out
 
     @app.get("/api/releases/{vid}/issues")
@@ -210,7 +272,7 @@ def create_app(runtime: AgentRuntime | None = None, auth: Authenticator | None =
         adapter = next((a for a in rt.adapters_for(rt._tenant(p)) if hasattr(a, "release_issues")), None)
         if adapter is None:
             raise HTTPException(404, "Jira is not connected")
-        ck = (p.tenant_id, f"{(project or getattr(adapter, 'project', '') or '').upper()}#{vid}")
+        ck = (p.tenant_id, f"{(project or getattr(adapter, 'project', '') or '').lower()}#{vid}")
         hit = releases_cache.get(ck)
         if hit and time.time() - hit[0] < 60:
             return hit[1]
@@ -285,6 +347,14 @@ def create_app(runtime: AgentRuntime | None = None, auth: Authenticator | None =
         return {k.value: rt.registry.names(k) for k in PluginKind}
 
     if WEB.exists():
+        @app.middleware("http")
+        async def no_stale_ui(request: Request, call_next: Any) -> Any:
+            """UI files change with every release; make browsers revalidate so a stale index.html never pairs with a new app.js."""
+            resp = await call_next(request)
+            if request.url.path in ("/", "/settings") or request.url.path.startswith("/static/"):
+                resp.headers["Cache-Control"] = "no-cache"
+            return resp
+
         app.mount("/static", StaticFiles(directory=WEB), name="static")
 
         @app.get("/")

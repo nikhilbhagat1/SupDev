@@ -79,6 +79,7 @@ def _exit_pr(ctx: ModeContext) -> ExitResult:
 
 class DevMode(ModeBase):
     name = "dev"
+    label = "Development"
     prompt_file = "dev_mode.md"
     router_signals = ["implement", "build", "develop", "add feature", "figma", "new feature", "user story"]
     ticket_types = {"story", "task", "feature", "epic"}
@@ -93,9 +94,9 @@ class DevMode(ModeBase):
             PhaseSpec("clarification", "Clarification", _exit_clarify),
             PhaseSpec("planning", "Planning", _exit_plan),
             PhaseSpec("plan_review", "Plan Review", _exit_review),
-            PhaseSpec("development", "Development", _exit_dev),
+            PhaseSpec("development", "Development", _exit_dev, hint="work"),
             PhaseSpec("testing", "Testing", _exit_test),
-            PhaseSpec("pr_gate", "PR Approval", _exit_pr),
+            PhaseSpec("pr_gate", "PR Approval", _exit_pr, hint="review"),
         ]
 
     # -- guardrails ----------------------------------------------------------------------

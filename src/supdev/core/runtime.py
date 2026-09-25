@@ -5,6 +5,7 @@ The model proposes (text + tool calls); the engine disposes (ToolGateway, PhaseM
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -43,7 +44,7 @@ from .policy import Policy
 from .prompt import PromptBuilder
 
 MAX_STEPS = 15
-_TAG = re.compile(r"^\s*\[(DEV|SUPPORT|ROUTER)\b")
+_TAG = re.compile(r"^\s*\[[A-Z][A-Z0-9_]*\b")  # any "[MODE · Phase n · Name]" tag — modes are plugins, so no fixed list
 
 
 @dataclass
@@ -60,6 +61,8 @@ class TenantSetup:
     service_catalog: str = ""
     version: int = 0  # settings-store version; a change makes the runtime reload the tenant
     llm: dict[str, Any] = field(default_factory=dict)  # {provider, model}; empty => platform default
+    board: dict[str, Any] = field(default_factory=dict)  # {"types": {mode: [names] | None}}
+    jira_sync: dict[str, Any] = field(default_factory=dict)  # opt-in: move the Jira ticket when the agent changes phase
 
 
 Emit = Callable[[Event], None]
@@ -305,9 +308,13 @@ class AgentRuntime:
             mode = self.registry.get(PluginKind.MODE, wi.mode)
             approvals = ApprovalService(pol)
 
-            def _emit(t: str, d: dict[str, Any], _s: Session = session) -> None:
+            phase_events: list[dict[str, Any]] = []
+
+            def _emit(t: str, d: dict[str, Any], _s: Session = session, _pe: list[dict[str, Any]] = phase_events) -> None:
                 if t == "approval_request":
                     self._audit(principal, _s, "approval_requested", detail=d)
+                if t == "phase":
+                    _pe.append(d)
                 emit(Event(type=t, data=d))
 
             ctx = ModeContext(session=session, work_item=wi, principal=principal, policy=pol,
@@ -338,6 +345,9 @@ class AgentRuntime:
                 res = await gw.invoke(ctx, mode, tc)
                 session.messages.append(Message(role="tool", text=res.content, tool_call_id=tc.id,
                                                 tool_name=tc.name))
+                if phase_events:  # the engine (not the model) mirrors the phase change to Jira, if the tenant enabled it
+                    await self._sync_jira(principal, session, wi, tenant, pol, emit, list(phase_events))
+                    phase_events.clear()
                 if res.display:
                     displays.append(res.display)
                 end = end or res.end_turn
@@ -350,6 +360,39 @@ class AgentRuntime:
                 break
         self.store.save(session)
         emit(Event(type="done", data={"session": session.snapshot_for_prompt()}))
+
+    # ------------------------------------------------------------------ Jira status sync
+    async def _sync_jira(self, principal: Principal, session: Session, wi: WorkItem, tenant: TenantSetup, pol: Policy,
+                         emit: Emit, events: list[dict[str, Any]]) -> None:
+        """Opt-in (Settings → Jira status sync, admin only): when the agent moves a work item FORWARD into a mapped phase, move the
+        linked Jira ticket (wi.ref) to the mapped status. Deterministic engine action — the model never chooses it. Best-effort:
+        a Jira problem is reported in the chat and audit log but never blocks the phase change. Audited; role-checked."""
+        cfg = tenant.jira_sync or {}
+        if not cfg.get("enabled") or not wi.ref:
+            return
+        mapping = cfg.get("map") or {}   # only what the tenant chose in Settings; nothing is assumed about their workflow
+        for ev in events:
+            names = (mapping.get(wi.mode) or {}).get(str(ev.get("phase")))
+            if ev.get("back") or not names:
+                continue
+            adapter = next((a for a in self.adapters_for(tenant) if hasattr(a, "transition_to_named")), None)
+            if adapter is None:
+                return
+            if not pol.can_approve(principal.role, ApprovalKind.TICKET_STATUS):
+                emit(Event(type="jira_sync_skipped", data={"key": wi.ref, "reason": f"role '{principal.role.value}' cannot change ticket status"}))
+                continue
+            emit(Event(type="audit_notice", data={"line": f"Will change Jira ticket {wi.ref} status to '{names[0]}' (automatic sync with phase "
+                                                          f"{ev.get('phase')} — {ev.get('title')}; enabled in Settings)"}))
+            try:
+                r = await asyncio.wait_for(adapter.transition_to_named(wi.ref, list(names)), 25)
+            except Exception as exc:  # noqa: BLE001 — never let a Jira problem break the workflow
+                why = self.redactor.redact(str(getattr(exc, "message", None) or exc))[0][:300]
+                self._audit(principal, session, "phase_status_sync_failed", detail={"key": wi.ref, "phase": ev.get("phase"), "reason": why})
+                emit(Event(type="jira_sync_failed", data={"key": wi.ref, "reason": why}))
+                continue
+            self._audit(principal, session, "phase_status_sync", detail={"key": wi.ref, "phase": ev.get("phase"), "from": r["from"],
+                                                                         "to": r["to"], "changed": r["changed"], "reason": r.get("reason")})
+            emit(Event(type="jira_status", data={"key": wi.ref, "from": r["from"], "to": r["to"], "changed": r["changed"], "reason": r.get("reason")}))
 
     # ------------------------------------------------------------------ helpers
     def _tag(self, mode: Any, wi: WorkItem) -> str:

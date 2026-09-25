@@ -68,6 +68,7 @@ def _exit_outputs(ctx: ModeContext) -> ExitResult:
 
 class SupportMode(ModeBase):
     name = "support"
+    label = "Support"
     prompt_file = "support_mode.md"
     router_signals = ["incident", "outage", "alert", "production", "prod ", "rca", "investigate",
                       "why did", "what happened", "latency", "errors", "5xx", "down"]
@@ -81,7 +82,7 @@ class SupportMode(ModeBase):
             PhaseSpec("triage", "Triage", _exit_triage),
             PhaseSpec("intake", "Intake", _exit_intake),
             PhaseSpec("clarification", "Clarification", _exit_clarify),
-            PhaseSpec("evidence", "Evidence collection", _exit_evidence),
+            PhaseSpec("evidence", "Evidence collection", _exit_evidence, hint="work"),
             PhaseSpec("hypotheses", "Timeline & hypotheses", _exit_hypo),
             PhaseSpec("rca_review", "RCA summary review", _exit_review),
             PhaseSpec("outputs", "Outputs", _exit_outputs),

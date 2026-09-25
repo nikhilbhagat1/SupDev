@@ -52,10 +52,24 @@ def jira(p: dict[str, Any], sec: dict[str, str]) -> Result:
     return cfg, _secrets(sec, {"token": "jira_token", "email": "jira_email"})
 
 
+_GH_URL = re.compile(r"^(?:https?://(?:www\.)?github\.com/|git@github\.com:|ssh://git@github\.com/|github\.com/)"
+                     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?(?:[/?#].*)?$")
+
+
+def normalize_repo(v: str) -> str:
+    """'org/name', 'org/name.git', 'https://github.com/org/name(.git)', 'git@github.com:org/name.git' -> 'org/name'."""
+    v = v.strip()
+    if m := _GH_URL.match(v):
+        return f"{m[1]}/{m[2]}"
+    v = v.removesuffix(".git").strip("/")
+    if _REPO.match(v):
+        return v
+    raise SupdevError("Repository must be 'org/name' or a github.com URL such as https://github.com/org/name "
+                      "(other Git hosts aren't supported yet)")
+
+
 def github(p: dict[str, Any], sec: dict[str, str]) -> Result:
-    repo = _s(p, "repo", True) or ""
-    if not _REPO.match(repo):
-        raise SupdevError("repo must look like 'org/name'")
+    repo = normalize_repo(_s(p, "repo", True) or "")
     cfg: dict[str, Any] = {"repo": repo, "secret": "github_token"}
     if b := _s(p, "default_branch", max_len=100):
         if not _BRANCH.match(b):
