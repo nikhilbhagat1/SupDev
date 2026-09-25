@@ -11,6 +11,7 @@ docs
 *.db
 *.db-wal
 *.db-shm
+.secrets
 audit.jsonl
 .supdev_master_key
 work

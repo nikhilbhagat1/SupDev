@@ -20,6 +20,7 @@ master.key
 .env
 .env.*
 !.env.example
+.secrets
 
 # IDE / OS
 .idea/
