@@ -1,4 +1,4 @@
-# Supdev — unified engineering agent
+# Supdev — Unified engineering agent
 
 One app, one agent, two modes, built from [`docs/source_system_prompt.md`](docs/source_system_prompt.md):
 
